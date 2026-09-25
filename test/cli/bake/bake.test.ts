@@ -634,6 +634,32 @@ test.concurrent.skipIf(isWindows)("bun bake keeps a unix socket from the export 
   expect(await res.text()).toBe("via unix");
 });
 
+// A supervisor binds the socket, and `bun bake` inherits it as descriptor 3. `fd` is POSIX only.
+test.concurrent.skipIf(isWindows)("bun bake keeps an fd from the export of app/server.ts", async () => {
+  using dir = tempDir("bake-command-fd", {});
+  await Bun.write(
+    join(String(dir), "app/server.ts"),
+    // `host` does not stop the descriptor: `bun bake` sets no address for it.
+    `export default { fd: 3, host: "localhost", fetch: () => new Response("via fd") };`,
+  );
+  const donor = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+  const url = `http://127.0.0.1:${donor.port}/`;
+
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "bake"],
+    env,
+    cwd: String(dir),
+    killSignal: "SIGKILL",
+    stdio: ["ignore", "pipe", "pipe", donor.fd],
+  });
+  // Only `bun bake` may accept on the socket.
+  donor.stop(true);
+  const output = collectOutput(proc);
+
+  expect((await output.waitFor(/url: (\S+)/))[1]).toBe(url);
+  expect(await (await fetch(url)).text()).toBe("via fd");
+});
+
 /** The CSS that the page at `path` links to. */
 async function getPageCss(url: string, path: string) {
   const html = await (await fetch(new URL(path, url))).text();
