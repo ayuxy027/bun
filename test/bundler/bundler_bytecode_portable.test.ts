@@ -562,7 +562,7 @@ describe("bytecode cache portability", () => {
           "js": "e1c4f1494711ecaae57a6d63dfb8ac6096629582f55cc42530ff5a156b70c9de",
           "jsc": {
             "bytes": 852464,
-            "sha256": "eb962b6462b67f21630e62e93be61772ff1d0d40555bb71259b6fdd1b391434b",
+            "sha256": "6cdcc3ef915aad48efc068e5579a76d37cfb6241b619455761f8ba8f7acf158a",
           },
         },
         "vm.Script big.js": {
