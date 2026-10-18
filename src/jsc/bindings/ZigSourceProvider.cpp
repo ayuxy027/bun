@@ -77,8 +77,10 @@ Ref<SourceProvider> SourceProvider::create(
 
     bool isCodeCoverageEnabled = !!globalObject->vm().controlFlowProfiler();
 
+    // Only what a JavaScript or TypeScript loader compiled is the path's code: a text, Markdown or sqlite import's
+    // module has the path as its URL too.
     bool shouldGenerateCodeCoverage = false;
-    if (isCodeCoverageEnabled && !isBuiltin) {
+    if (isCodeCoverageEnabled && !isBuiltin && isJavaScriptTag(resolvedSource.tag)) {
         BunString sourceURLBunString = Bun::toString(sourceURLString);
         shouldGenerateCodeCoverage = BunTest__shouldGenerateCodeCoverage(&sourceURLBunString);
     }

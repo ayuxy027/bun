@@ -378,6 +378,12 @@ typedef struct {
 
 #include "SyntheticModuleType.h"
 
+// The text that the transpiler returns under one of these tags is what a JavaScript or TypeScript loader compiled for the
+// module's path (Rust: ResolvedSourceTag::is_javascript). Under its other tags it returns a value, or module text Bun
+// generated. A builtin does not follow this: bun:wrap has the default tag.
+inline constexpr bool isJavaScriptTag(uint32_t tag) { return tag <= SyntheticModuleType::PackageJSONTypeCommonJS; }
+static_assert(SyntheticModuleType::JavaScript == 0 && SyntheticModuleType::PackageJSONTypeModule == 1 && SyntheticModuleType::PackageJSONTypeCommonJS == 2, "isJavaScriptTag is a range test over the first three tags");
+
 extern "C" const char* Bun__userAgent;
 
 extern "C" bool Bun__transpileVirtualModule(
