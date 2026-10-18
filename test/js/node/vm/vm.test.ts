@@ -1379,15 +1379,24 @@ describe("the compiled code of more than 2000 distinct sources stays cached", ()
     return JSON.parse(stdout);
   }
 
-  test.concurrent("Script", async () => {
-    const { cached } = await runFixture({ VM_FIXTURE_KIND: "script" });
-    expect(cached).toBeGreaterThanOrEqual(2500);
-  });
+  // 2500 compiles take a few seconds on a debug build with ASAN.
+  test.concurrent(
+    "Script",
+    async () => {
+      const { cached } = await runFixture({ VM_FIXTURE_KIND: "script" });
+      expect(cached).toBeGreaterThanOrEqual(2500);
+    },
+    30_000,
+  );
 
-  test.concurrent("compileFunction", async () => {
-    const { cached } = await runFixture({ VM_FIXTURE_KIND: "compileFunction" });
-    expect(cached).toBeGreaterThanOrEqual(2500);
-  });
+  test.concurrent(
+    "compileFunction",
+    async () => {
+      const { cached } = await runFixture({ VM_FIXTURE_KIND: "compileFunction" });
+      expect(cached).toBeGreaterThanOrEqual(2500);
+    },
+    30_000,
+  );
 
   test.concurrent(
     "the idle GC ladder drops what nothing compiled again",
