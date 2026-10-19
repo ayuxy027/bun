@@ -89,6 +89,8 @@ const kPendingCloseGenerations = Symbol("http.server.pendingCloseGenerations");
 const kListenerGeneration = Symbol("http.server.listenerGeneration");
 // Set on the 'connect'/'upgrade' handoff; closeAll/closeIdleConnections() skip these, as in Node.
 const kHandedOff = Symbol("http.server.socketHandedOff");
+// True on a TLS connection from its accept to 'secureConnection'. See isHandshaking().
+const kHandshaking = Symbol("http.server.socketHandshaking");
 function closeHandle(handle) {
   if (!handle.closed) handle.close();
 }
@@ -493,6 +495,7 @@ function checkConnections(this: Server) {
   }
 
   for (const socket of connections) {
+    if (isHandshaking(socket)) continue;
     const handle = socket[kHandle];
     if (handle?.isRequestTimedOut?.(headersTimeout, requestTimeout)) {
       onRequestTimeout(socket);
@@ -519,11 +522,11 @@ Server.prototype.unref = function () {
 
 Server.prototype.closeAllConnections = function () {
   http1Fallback?.closeAllHttp1Connections(this);
-  // Like Node, the listener and the sockets handed to 'connect' and 'upgrade' listeners stay.
+  // Like Node, the listener, the sockets handed to 'connect' and 'upgrade' listeners and the TLS connections that have not finished their handshake stay.
   const tracked = this[kTrackedConnections];
   if (tracked && tracked.size > 0) {
     for (const socket of $Array.from(tracked) as NodeHTTPServerSocket[]) {
-      if (!socket[kHandedOff]) socket.destroyNow();
+      if (!socket[kHandedOff] && !isHandshaking(socket)) socket.destroyNow();
     }
   }
 };
@@ -751,6 +754,8 @@ Server.prototype[kRealListen] = function (tls, port, host, socketPath, reusePort
         if (!socket) {
           socket = new (getNodeHTTPServerSocket())(server, socketHandle, !!tls, listenerGeneration);
         }
+        // usockets reports a handshake before any data of its connection: 'secureConnection' is behind this request.
+        $assert(!isHandshaking(socket));
 
         if (isPipelinedDispatch) {
           // The native handle holds this request's turn until its response exists, also when a throw prevents that.
@@ -1143,6 +1148,7 @@ Server.prototype[kRealListen] = function (tls, port, host, socketPath, reusePort
     const handle = this[serverSymbol];
     listenerGeneration = {
       isUnix: !!socketPath,
+      tls,
       nativeClosed: false,
       drainedAtClose: false,
     };
@@ -1240,15 +1246,29 @@ function defineMaxHeadersCount(server: Server) {
   });
 }
 
-// Native callback fired when the server accepts a connection (for TLS, when
-// its handshake completes), before any request bytes - like Node.js's
-// net.Server 'connection' / tls.Server 'secureConnection' events.
-function onServerConnection(this: Server, listenerGeneration, socketHandle) {
-  if (socketHandle.duplex) {
-    // Already wrapped (shouldn't happen for a brand-new connection).
+// Native callback fired when the server accepts a connection, before any byte of it is read, like
+// Node.js's net.Server 'connection' event. A TLS connection gets a second call, with `secured`,
+// when its handshake has succeeded, like tls.Server's 'secureConnection' event.
+function onServerConnection(this: Server, listenerGeneration, socketHandle, secured: boolean) {
+  if (secured) {
+    const socket = socketHandle.duplex;
+    socket[kHandshaking] = false;
+    socket._secureEstablished = true;
+    // Node's connectionListener takes a TLS connection here. The constructor of the socket left these out.
+    socket.on("timeout", onNodeHTTPServerSocketTimeout);
+    // Node has a second timer, on the raw socket: a shorter timeout that a 'connection' listener armed
+    // stays. It can have fired during the handshake, so it starts again.
+    const serverTimeout = this.timeout;
+    if (serverTimeout && !(socket.timeout > 0 && socket.timeout < serverTimeout)) {
+      socket.setTimeout(serverTimeout);
+    } else {
+      socket._unrefTimer();
+    }
+    socket.parser = createServerParserShim(socket);
+    this.emit("secureConnection", socket);
     return;
   }
-  const isTLS = !!this[tlsSymbol];
+  const isTLS = !!listenerGeneration.tls;
   const socket = new (getNodeHTTPServerSocket())(this, socketHandle, isTLS, listenerGeneration);
 
   // Node's net.Server accept path refuses at maxConnections and emits 'drop'; the native
@@ -1290,13 +1310,16 @@ function onServerConnection(this: Server, listenerGeneration, socketHandle) {
     }
   }
 
-  // Node's connectionListener attaches the HTTPParser (socket.parser) before
-  // emitting 'connection'; expose the shim here so listeners see it populated.
-  socket.parser = createServerParserShim(socket);
+  // Node's connectionListener attaches the HTTPParser (socket.parser) before its listeners see the
+  // connection: expose the shim here for plain TCP, and with 'secureConnection' for TLS.
+  if (!isTLS) socket.parser = createServerParserShim(socket);
   this.emit("connection", socket);
-  if (isTLS && socketHandle.secureEstablished) {
-    this.emit("secureConnection", socket);
-  }
+}
+
+// A TLS connection before 'secureConnection'. Node's connectionListener has not run for it: it has
+// no parser, server.timeout does not apply, and the timeout sweep and closeAllConnections() leave it alone.
+function isHandshaking(socket) {
+  return socket[kHandshaking] === true;
 }
 
 // Like Node.js: server.setTimeout only records the per-socket inactivity
@@ -1714,7 +1737,11 @@ function getNodeHTTPServerSocket() {
       handle.duplex = this;
 
       this.encrypted = encrypted;
-      this.on("timeout", onNodeHTTPServerSocketTimeout);
+      // Node's connectionListener takes a TLS connection at 'secureConnection': onServerConnection()
+      // does there what this leaves out for one that has not finished its handshake.
+      const handshaking = encrypted && !this._secureEstablished;
+      if (handshaking) this[kHandshaking] = true;
+      else this.on("timeout", onNodeHTTPServerSocketTimeout);
       // Like Node.js's socketOnError: connection errors are routed to the
       // server's 'clientError' event instead of crashing as unhandled 'error'
       // events on the socket.
@@ -1723,7 +1750,7 @@ function getNodeHTTPServerSocket() {
       // Like Node.js's connectionListener: server.setTimeout's per-socket
       // inactivity timeout is armed when the connection is established.
       const serverTimeout = server.timeout;
-      if (serverTimeout) {
+      if (serverTimeout && !handshaking) {
         this.setTimeout(serverTimeout);
       }
     }

@@ -30,6 +30,7 @@ fn server_js_create(
 use bun_io::KeepAlive;
 use bun_uws as uws;
 use bun_uws_sys as uws_sys;
+use bun_uws_sys::app::FilterEvent;
 use bun_uws_sys::app::c as uws_app_c;
 
 use bun_jsc::{JSGlobalObject, JSValue, JsResult};
@@ -503,10 +504,11 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
         self.pending_requests.set(self.pending_requests.get() + 1);
     }
 
-    /// uWS filter: `+2` at TCP accept (before any TLS handshake), `-2` on
+    /// uWS filter: `Accepted` at TCP accept (before any TLS handshake), `AcceptedClosed` on
     /// `HttpContext::onClose` / `HttpResponse::upgrade()` — see
     /// `AsyncSocketData::filteredAccept`. Feeds [`Self::active_connection_count`].
-    /// `-3` / `+3`: a node:http tunnel becomes idle / has bytes to send again. `-4`: it closes idle.
+    /// `TunnelIdle` / `TunnelBusy`: a node:http tunnel becomes idle / has bytes to send again.
+    /// `IdleTunnelClosed`: it closes idle.
     extern "C" fn on_connection_filter(
         _socket: *mut uws_sys::us_socket_t,
         opened: i32,
@@ -518,14 +520,14 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
             // formed (the count is a `Cell`), so this is sound when reached
             // from inside `app.close()` while `stop_listening` holds `&mut`.
             let this = unsafe { &*user_data.cast::<Self>() };
-            // Count from accept (2 / -2), not from open (1 / -1): a TLS socket accepted but still
+            // Count from accept, not from open: a TLS socket accepted but still
             // handshaking is a connection too — it will dispatch once the handshake completes.
-            match opened {
-                2 => {
+            match FilterEvent::from_repr(opened) {
+                Some(FilterEvent::Accepted) => {
                     this.note_connection_opened();
                     return;
                 }
-                3 => {
+                Some(FilterEvent::TunnelBusy) => {
                     this.note_tunnel_idle(false);
                     // With a listener open, the loop ref is the user's to drop (`server.unref()`).
                     if !this.has_listener() {
@@ -534,13 +536,13 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
                     }
                     return;
                 }
-                -3 => this.note_tunnel_idle(true),
-                -4 => {
+                Some(FilterEvent::TunnelIdle) => this.note_tunnel_idle(true),
+                Some(FilterEvent::IdleTunnelClosed) => {
                     this.note_tunnel_idle(false);
                     this.note_connection_closed();
                 }
-                -2 => this.note_connection_closed(),
-                _ => return,
+                Some(FilterEvent::AcceptedClosed) => this.note_connection_closed(),
+                Some(FilterEvent::Opened | FilterEvent::Closed) | None => return,
             }
             !this.has_loop_holding_connections()
                 && !this.has_listener()
