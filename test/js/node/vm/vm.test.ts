@@ -1330,8 +1330,10 @@ describe("Script compiles its source once and links that in every context it run
 describe("the compiled code of more than 2000 distinct sources stays cached", () => {
   // JSC keeps the unlinked code of every program it compiled in a per-VM cache, so a source compiled again is not
   // parsed again. Upstream bounds that cache at 2000 entries: a loader that cycles through more distinct sources than
-  // that misses on every one of them. Bun's engine bounds it by bytes instead, and the last rung of the idle GC ladder
-  // (BUN_IDLE_GC_SECONDS) drops the entries nothing has compiled again since the rung before it.
+  // that misses on every one of them. Bun's engine bounds it by bytes instead (BUN_JSC_codeCacheWorkingSetMaxBytes, a
+  // window of new sources, each counting as its length plus 1 KB: the cache holds one to two windows of sources that
+  // never repeat), and the last rung of the idle GC ladder (BUN_IDLE_GC_SECONDS) drops the entries nothing has
+  // compiled again since the rung before it.
   //
   // The fixture compiles VM_FIXTURE_COUNT distinct sources, keeps none of them, and reports how many
   // UnlinkedProgramCodeBlock cells (one per compiled program) survive a full collection: only the cache holds them.
@@ -1394,6 +1396,20 @@ describe("the compiled code of more than 2000 distinct sources stays cached", ()
     async () => {
       const { cached } = await runFixture({ VM_FIXTURE_KIND: "compileFunction" });
       expect(cached).toBeGreaterThanOrEqual(2500);
+    },
+    30_000,
+  );
+
+  test.concurrent(
+    "sources that never repeat stay within two windows of the byte bound",
+    async () => {
+      const { cached } = await runFixture({
+        VM_FIXTURE_KIND: "script",
+        VM_FIXTURE_COUNT: "5000",
+        BUN_JSC_codeCacheWorkingSetMaxBytes: "1000000",
+      });
+      expect(cached).toBeLessThanOrEqual((2 * 1000000) / 1024 + 2);
+      expect(cached).toBeGreaterThanOrEqual(1000000 / 1030 - 2);
     },
     30_000,
   );
