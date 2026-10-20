@@ -286,9 +286,23 @@ impl<const IS_SSL: bool> NewSocketHandler<IS_SSL> {
         )
     }
 
+    /// Reads AND clears `SO_ERROR`. Once it has taken a pending reset, the next
+    /// `recv()` returns 0 like a FIN, so a caller that still reads a body from
+    /// this socket must not call it: it is for the decision to keep or drop a
+    /// connection whose exchange is over.
     #[inline]
     pub fn is_closed_or_has_error(&self) -> bool {
         self.is_closed() || self.is_shutdown() || self.get_error() != 0
+    }
+
+    /// The errno of the `send()` that made TLS end this socket's write side by
+    /// itself; 0 when no send was rejected, and for a plain-TCP socket.
+    /// Readable until `on_close` returns.
+    pub fn rejected_send_error(&self) -> i32 {
+        match self.socket {
+            InternalSocket::Connected(s) => sock(s).rejected_send_error(),
+            _ => 0,
+        }
     }
 
     /// What the read side holds right now, without waiting for the loop to

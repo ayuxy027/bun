@@ -704,6 +704,10 @@ int us_socket_is_closed(us_socket_r s) nonnull_fn_decl;
  * own a socket between loop iterations use this to tell an idle connection
  * from one the peer has already written to or closed. */
 int us_socket_queued_input(us_socket_r s) nonnull_fn_decl;
+/* The error (errno, a WSA code on Windows) of the send() that made TLS end
+ * this socket's write side by itself. 0 when no send was rejected, and for a
+ * plain-TCP socket. Readable until on_close returns. */
+int us_socket_rejected_send_error(us_socket_r s) nonnull_fn_decl;
 
 int us_socket_is_ssl_handshake_finished(us_socket_r s) nonnull_fn_decl;
 int us_socket_ssl_handshake_callback_has_fired(us_socket_r s) nonnull_fn_decl;

@@ -204,7 +204,7 @@ struct us_ssl_spill_t {
   char data[];
 };
 
-/* Allocated for an accepted socket, a node:tls socket's events, a client's first renegotiation, fetch's session sink, and a first spill. */
+/* Allocated for an accepted socket, a node:tls socket's events, a client's first renegotiation, fetch's session sink, a first spill, and a rejected send. */
 struct us_ssl_rare_t {
   /* Non-NULL exactly while us_socket_t::ssl_spilled is set. */
   struct us_ssl_spill_t *spill;
@@ -216,7 +216,10 @@ struct us_ssl_rare_t {
   void (*session_sink_free)(void *sink);
   uint64_t reneg_window_start_ms;
   uint32_t reneg_count;
+  /* The error of the send() behind us_socket_t::ssl_send_rejected, for us_socket_rejected_send_error. */
+  int rejected_send_error;
 };
+_Static_assert(sizeof(struct us_ssl_rare_t) == 64, "us_ssl_rare_t grew");
 
 static void us_ctx_ex_free(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
                            int index, long argl, void *argp) {
@@ -455,6 +458,11 @@ void *us_socket_session_sink(struct us_socket_t *s) {
   return rare ? rare->session_sink : NULL;
 }
 
+int us_socket_rejected_send_error(struct us_socket_t *s) {
+  struct us_ssl_rare_t *rare = s->ssl ? us_ssl_rare(s_ssl(s)) : NULL;
+  return rare ? rare->rejected_send_error : 0;
+}
+
 /* socket.c — raw TCP FIN that does NOT re-enter the SSL layer. */
 extern void us_internal_socket_raw_shutdown(struct us_socket_t *s);
 
@@ -527,12 +535,19 @@ void us_internal_ssl_loop_state_restore(void **saved) {
   d->ssl_write_batching = (int)(uintptr_t)saved[5];
 }
 
+/* Out of line: ssl_raw_write is inlined, and its callers pay nothing for this. Keeps the error of the first send that uSockets rejected. A send with an errno outside the peer-gone list (socket.c) is retried, so the send that is finally rejected can carry EPIPE. */
+__attribute__((noinline, cold)) static void ssl_keep_rejected_send_error(struct us_socket_t *s, int send_error) {
+  struct us_ssl_rare_t *rare = us_ssl_rare_ensure(s_ssl(s));
+  if (!rare->rejected_send_error) rare->rejected_send_error = send_error;
+}
+
 /* A send() that no retry can save loses sealed records: nothing may follow them, but what the peer sent is still read. */
 static int ssl_raw_write(struct loop_ssl_data *loop_ssl_data, struct us_socket_t *s, const char *data, int length) {
   int send_error = 0;
   int written = us_internal_socket_raw_write(s, data, length, &send_error);
   if (send_error) {
     loop_ssl_data->ssl_send_error = send_error;
+    ssl_keep_rejected_send_error(s, send_error);
     s->ssl_send_rejected = 1;
     us_internal_socket_raw_shutdown(s);
     /* No write may close under its caller: us_internal_ssl_on_writable does. */

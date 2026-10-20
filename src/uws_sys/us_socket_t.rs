@@ -490,6 +490,10 @@ impl us_socket_t {
             _ => QueuedInput::None,
         }
     }
+
+    pub(crate) fn rejected_send_error(&self) -> i32 {
+        c::us_socket_rejected_send_error(self)
+    }
 }
 
 /// Raw externs. Private — every operation has a typed method on `us_socket_t`.
@@ -597,6 +601,7 @@ mod c {
         pub(super) safe fn us_socket_get_error(s: &us_socket_t) -> c_int;
         pub(super) safe fn us_socket_is_established(s: &us_socket_t) -> i32;
         pub(super) safe fn us_socket_queued_input(s: &us_socket_t) -> c_int;
+        pub(super) safe fn us_socket_rejected_send_error(s: &us_socket_t) -> c_int;
 
         /// ssl_ctx is required (the whole point); sni may be null.
         pub(super) fn us_socket_adopt_tls(

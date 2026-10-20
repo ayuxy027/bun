@@ -4,6 +4,7 @@ use core::ptr::NonNull;
 
 use crate::Error;
 use crate::http_thread::InitOpts as HTTPThreadInitOpts;
+use crate::internal_state::ReadEnd;
 use crate::ssl_config::{self, SSLConfig};
 use crate::{
     self as http, AlpnOffer, HTTPCertError, HTTPClient, InitError, ProxyTunnel,
@@ -1460,12 +1461,55 @@ impl<const SSL: bool> Handler<SSL> {
         HTTPContext::<SSL>::terminate_socket(socket);
     }
 
-    pub fn on_close(ptr: *mut c_void, socket: HTTPSocket<SSL>, _: c_int, _: Option<*mut c_void>) {
+    /// How the read side of `socket` ended, from the close that uSockets reports with
+    /// `code`: above `CloseCode::fast_shutdown` that is the error of the failed read (loop.c).
+    fn read_end(socket: HTTPSocket<SSL>, code: c_int) -> ReadEnd {
+        if !http::STRICT_READ_END {
+            return ReadEnd::Fin;
+        }
+        if SSL {
+            // The peer's close_notify ended its stream, whatever the connection did after
+            // it. BoringSSL sets the flag for a fatal read error too; uSockets closes that
+            // session itself, with no errno.
+            let peer_ended_stream = socket.ssl().is_some_and(|ssl| {
+                // SAFETY: uSockets frees the `SSL` after the close dispatch that this runs in.
+                (unsafe { bun_boringssl_sys::SSL_get_shutdown(ssl) }
+                    & bun_boringssl_sys::SSL_RECEIVED_SHUTDOWN)
+                    != 0
+            });
+            if peer_ended_stream {
+                return ReadEnd::Fin;
+            }
+            // A send that TLS saw rejected took the connection's error. The close that
+            // follows has a literal ECONNRESET (`ssl_close_after_rejected_send`) or no
+            // error at all, so the error of that send decides.
+            let rejected_send_error = socket.rejected_send_error();
+            if rejected_send_error != 0 {
+                return if http::send_took_reset(rejected_send_error) {
+                    ReadEnd::Error
+                } else {
+                    ReadEnd::Fin
+                };
+            }
+        }
+        if http::is_cut(code) {
+            ReadEnd::Error
+        } else {
+            ReadEnd::Fin
+        }
+    }
+
+    pub fn on_close(
+        ptr: *mut c_void,
+        socket: HTTPSocket<SSL>,
+        code: c_int,
+        _: Option<*mut c_void>,
+    ) {
         let tagged = HTTPContext::<SSL>::get_tagged(ptr);
         HTTPContext::<SSL>::mark_socket_as_dead(socket);
 
         if let Some(client) = tagged.client_mut() {
-            return client.on_close::<SSL>(socket);
+            return client.on_close::<SSL>(socket, Self::read_end(socket, code));
         }
         if let Some(session) = tagged.session() {
             return h2::ClientSession::on_close(session, crate::Error::ConnectionClosed);
@@ -1624,7 +1668,7 @@ impl<const SSL: bool> Handler<SSL> {
             } else {
                 socket.close(uws::CloseKind::Normal);
             }
-            client.on_close::<SSL>(socket);
+            client.on_close::<SSL>(socket, ReadEnd::Fin);
             return;
         }
         if let Some(session) = tagged.session() {
