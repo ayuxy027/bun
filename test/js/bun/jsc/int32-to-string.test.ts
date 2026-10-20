@@ -25,46 +25,48 @@ const paths: Record<string, (n: number) => string> = {
   "toString(10)": n => n.toString(10),
 };
 
+function run(path: (n: number) => string, values: number[]): string[] {
+  const out: string[] = [];
+  for (const n of values) out.push(path(n));
+  return out;
+}
+
 describe("int32 to string", () => {
   test("a monotonic counter, each value seen once", () => {
+    const values: number[] = [];
     let count = 5_000_000;
     for (let i = 0; i < 20_000; i++) {
-      const expected = slowDigits(count);
-      for (const name in paths) {
-        expect(paths[name](count), name).toBe(expected);
-      }
+      values.push(count);
       count = (count + 1) | 0;
+    }
+    const expected = values.map(slowDigits);
+    for (const name in paths) {
+      expect(run(paths[name], values), name).toEqual(expected);
     }
   });
 
   test("values seen two and three times in the same slot", () => {
+    const values: number[] = [];
     for (let i = 0; i < 10_000; i++) {
       const n = 1_000_000 + (i & 255);
-      const expected = slowDigits(n);
-      expect("" + n).toBe(expected);
-      expect("" + n).toBe(expected);
-      expect("" + n).toBe(expected);
+      values.push(n, n, n);
     }
+    expect(run(paths.concat, values)).toEqual(values.map(slowDigits));
   });
 
   test("edge values", () => {
     const edges = [1023, 1024, 1025, -1, -1024, -1025, 2147483647, -2147483648, 2147483646, -2147483647, 65536, -65536];
-    for (let r = 0; r < 3; r++) {
-      for (const n of edges) {
-        const expected = slowDigits(n);
-        for (const name in paths) {
-          expect(paths[name](n), name).toBe(expected);
-        }
-      }
+    const values = [...edges, ...edges, ...edges];
+    const expected = values.map(slowDigits);
+    for (const name in paths) {
+      expect(run(paths[name], values), name).toEqual(expected);
     }
   });
 
   test("two values that alternate", () => {
-    for (let i = 0; i < 10_000; i++) {
-      expect("" + 123456789).toBe("123456789");
-      expect("" + 987654321).toBe("987654321");
-      expect("" + 123456789).toBe("123456789");
-      expect("" + 987654321).toBe("987654321");
-    }
+    const values: number[] = [];
+    for (let i = 0; i < 10_000; i++) values.push(123456789, 987654321);
+    const expected = values.map(n => (n === 123456789 ? "123456789" : "987654321"));
+    expect(run(paths.concat, values)).toEqual(expected);
   });
 });
