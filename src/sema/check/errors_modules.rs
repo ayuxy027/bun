@@ -131,7 +131,6 @@ impl Checker<'_, '_> {
         };
         self.modules_statements(&cx, hir.body, top);
         self.modules_misplaced_statements(&cx, top);
-        self.modules_import_calls_and_types(&cx);
         for (&decl, &sym) in cx.aliases.iter() {
             // `checkVariableLikeDeclaration`
             if let Decl::Require(name) = decl {
@@ -1759,24 +1758,18 @@ impl Checker<'_, '_> {
         }
     }
 
-    /// `checkImportType`: `getResolutionModeOverride`
-    fn modules_import_calls_and_types(&mut self, cx: &Cx<'_>) {
-        let (hir, bound) = (self.hir(cx.file), self.bound(cx.file));
-        if !cx.grammar || hir.import_attributes.is_empty() {
+    /// `checkImportType`: `getResolutionModeOverride(attributes, true /*reportErrors*/)` for the import type `node`.
+    pub(super) fn check_attributes_of_import_type(&mut self, file: FileId, node: TypeNodeId) {
+        let hir = self.hir(file);
+        if hir.import_attributes.is_empty() || has_parse_diagnostics(hir) {
             return;
         }
-        for (i, node) in hir.types.iter().enumerate() {
-            if !matches!(node.kind, TypeNodeKind::Import { .. }) || bound.is_unchecked_type(i) {
-                continue;
-            }
-            if let Some(object) = hir.attributes_of_import_type(TypeNodeId(i as u32))
-                && let ExprKind::Object(attributes) = hir[object].kind
-            {
-                // The `ImportAttributes` node starts at the inner `{`: `with` is a property of the enclosing object literal.
-                let end = self.modules_end_of_import_attributes(cx.file, object);
-                let node = (cx.file, hir[object].pos, end);
-                self.get_resolution_mode_override(node, attributes, true);
-            }
+        if let Some(object) = hir.attributes_of_import_type(node)
+            && let ExprKind::Object(attributes) = hir[object].kind
+        {
+            // The `ImportAttributes` node starts at the inner `{`: `with` is a property of the enclosing object literal.
+            let end = self.modules_end_of_import_attributes(file, object);
+            self.get_resolution_mode_override((file, hir[object].pos, end), attributes, true);
         }
     }
 }

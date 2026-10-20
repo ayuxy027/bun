@@ -3441,6 +3441,31 @@ impl<'p, 's> Checker<'p, 's> {
         self.type_reference_type_of_node(file, scope, node, sym, args)
     }
 
+    /// `resolveExternalModuleName(node, n.Argument.AsLiteralTypeNode().Literal, false /*ignoreErrors*/)` of
+    /// `getTypeFromImportTypeNode`, for what it reports: the import type `node` of `file` names `spec`.
+    fn resolve_external_module_of_import_type(&mut self, file: FileId, node: TypeNodeId, spec: Atom) {
+        let hir = self.hir(file);
+        let (start, end) = (hir[node].pos, hir[node].end);
+        // The argument is the first specifier in the node. Those of the import types in its type arguments come after it.
+        let is_in_node = |it: &&SpecifierUse| {
+            it.kind == SpecifierKind::ImportType && it.spec == spec && (start..end).contains(&it.pos)
+        };
+        let uses = &hir.specifier_uses;
+        // FOR SPEED: the parser adds the specifiers of import types in source order. Calls may be out of order around them.
+        let first = uses.get(uses.partition_point(|it| it.pos < start));
+        let written = match first.filter(is_in_node) {
+            Some(written) => Some(written),
+            None => uses.iter().filter(is_in_node).min_by_key(|it| it.pos),
+        };
+        if let Some(&written) = written {
+            let site = SpecifierSite {
+                is_ambient: hir.kind == FileKind::Declaration,
+                ..Default::default()
+            };
+            self.resolve_external_module(file, written, site);
+        }
+    }
+
     /// The qualifier loop of `getTypeFromImportTypeNode`. Returns the final `currentNamespace` (the module symbol if there is no qualifier),
     /// or `None` where tsgo returns `errorType`.
     pub(super) fn resolve_import_type(
@@ -3465,6 +3490,9 @@ impl<'p, 's> Checker<'p, 's> {
         } else {
             SymFlags::TYPE
         };
+        if reports_errors {
+            self.resolve_external_module_of_import_type(file, node, spec);
+        }
         let mode = files.mode_of_import(file, mode);
         let inner_module_symbol = files.module_of_specifier_as(file, spec, mode)?;
         let module_symbol = self.resolve_external_module_symbol(inner_module_symbol);

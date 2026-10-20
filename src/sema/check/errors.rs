@@ -515,21 +515,11 @@ impl Checker<'_, '_> {
         }
     }
 
-    /// The callers of `resolveExternalModule` other than the import and export declarations. 2322
-    /// 2880 for the options of `import()`.
+    /// The callers of `resolveExternalModule` other than the import and export declarations and `getTypeFromImportTypeNode`.
+    /// 2322 2880 for the options of `import()`.
     fn check_modules(&mut self, file: FileId) {
         let hir = self.hir(file);
         let is_ambient = hir.kind == FileKind::Declaration;
-        // `getTypeFromImportTypeNode`
-        for &written in &hir.specifier_uses {
-            if written.kind == SpecifierKind::ImportType {
-                let site = SpecifierSite {
-                    is_ambient,
-                    ..Default::default()
-                };
-                self.resolve_external_module(file, written, site);
-            }
-        }
         let index = self.exprs_by_kind(file);
         // `checkImportCallExpression`
         for &e in index.of(ExprTag::ImportCall) {

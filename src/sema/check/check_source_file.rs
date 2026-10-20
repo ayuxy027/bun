@@ -912,6 +912,7 @@ impl<'s> Checker<'_, 's> {
         self.leave_heritage_expressions_unvisited(file, decl.other_implements);
         if symbol.is_some() {
             self.check_class_heritage(file, class);
+            self.check_type_for_duplicate_index_signatures(file, decl.members);
             self.check_property_initialization(file, class);
         }
     }
@@ -953,6 +954,7 @@ impl<'s> Checker<'_, 's> {
         self.leave_heritage_expressions_unvisited(file, decl.extends);
         self.leave_heritage_expressions_unvisited(file, decl.other_heritage);
         self.check_members(file, decl.members);
+        self.check_type_for_duplicate_index_signatures(file, decl.members);
     }
 
     /// `checkTypeAliasDeclaration`
@@ -1254,6 +1256,7 @@ impl<'s> Checker<'_, 's> {
                 if spec.is_none() {
                     self.check_type_nodes(file, args);
                 }
+                self.check_attributes_of_import_type(file, node);
                 self.check_type_reference_or_import(file, node)
             }
             // `checkThisType`
@@ -1272,6 +1275,7 @@ impl<'s> Checker<'_, 's> {
                 let ty = self.type_from_node(file, node);
                 if (members.iter()).any(|m| hir[m].kind == MemberKind::IndexSignature) {
                     self.check_index_constraints(file, ty, &[(file, members)], false, None);
+                    self.check_type_for_duplicate_index_signatures(file, members);
                 }
                 // Another task may have stored `ty`.
                 self.get_members_of_type_literal(file, members);
