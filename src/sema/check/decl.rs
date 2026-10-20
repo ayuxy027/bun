@@ -3338,7 +3338,7 @@ impl<'p, 's> Checker<'p, 's> {
                 if !has_type_arguments {
                     return ty;
                 }
-                let args = self.types_from_nodes(file, args);
+                let args = self.type_arguments_of_instantiation(ty, file, args);
                 self.with_type_arguments(ty, &args, InstantiationExpression::TypeNode(file, node))
             }
             TypeNodeKind::Import { .. } => self.get_type_from_import_type_node(file, scope, node),
@@ -3411,7 +3411,7 @@ impl<'p, 's> Checker<'p, 's> {
             {
                 return ty;
             }
-            let args = self.types_from_nodes(file, args);
+            let args = self.type_arguments_of_instantiation(ty, file, args);
             let node = InstantiationExpression::TypeNode(file, node);
             return self.with_type_arguments(ty, &args, node);
         }
