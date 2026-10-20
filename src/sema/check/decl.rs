@@ -1101,6 +1101,33 @@ impl<'p, 's> Checker<'p, 's> {
         }))
     }
 
+    /// The type arguments of the import types of `file`, each from its first argument to the end of the import type.
+    /// `checkImportType` checks nothing below them, and `getTypeFromTypeNode` resolves them as far as something asks.
+    pub(super) fn type_arguments_of_import_types(&self, file: FileId) -> Places {
+        let hir = self.hir(file);
+        let mut specifiers = hir.specifier_uses.iter();
+        if !specifiers.any(|it| it.kind == SpecifierKind::ImportType) {
+            return Places::new(std::iter::empty());
+        }
+        Places::new(hir.types.iter().filter_map(|node| match node.kind {
+            TypeNodeKind::Import { spec, args, .. } if spec.is_some() => {
+                let first = hir.ids(args).next()?;
+                Some(TextRange {
+                    pos: hir[first].pos,
+                    end: node.end,
+                })
+            }
+            _ => None,
+        }))
+    }
+
+    /// Whether the check of `file` leaves what is at `pos` to whoever asks for it: see `type_arguments_of_import_types` and
+    /// `unchecked_jsdoc_types`.
+    pub(super) fn is_resolved_on_request_at(&self, file: FileId, pos: u32) -> bool {
+        self.type_arguments_of_import_types(file).contain(pos)
+            || self.unchecked_jsdoc_types(file).contain(pos)
+    }
+
     /// `getAliasSymbolForTypeNode`: the type alias declaration whose body is `node`, which is in
     /// `scope`. A `readonly` operator around `node` is skipped.
     pub(super) fn alias_with_body(

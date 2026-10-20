@@ -300,6 +300,15 @@ impl<'s> Task<'s> {
         }
     }
 
+    /// The task has left an error to an earlier file whose own check does not ask for what has reported it: tsc reports
+    /// it only if a file before that of the task asks. Whoever does has to find nothing that this task has stored on the
+    /// way there. That holds if every file before is checked for good. Any other task is lost.
+    pub(super) fn leave_to_whoever_asks_before(&self, why: &'static str) {
+        if !self.is_first_in_order.get() {
+            self.lose(why);
+        }
+    }
+
     /// Returns the `members` of the cycles this task has resolved since its last commit, sorted. For a task that was
     /// discarded because of a cycle, that cycle is included.
     pub(super) fn take_cycle_members(&self) -> Vec<u64> {

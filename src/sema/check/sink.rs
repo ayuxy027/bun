@@ -811,6 +811,9 @@ impl Checker<'_, '_> {
             && !diagnostic.by_emit
             && self.is_left_to_an_earlier_file(owner, diagnostic.file)
         {
+            if self.is_resolved_on_request_at(diagnostic.file, diagnostic.start) {
+                (self.task).leave_to_whoever_asks_before("an error that no check asks for");
+            }
             // Not every error comes through `add_diagnostic`.
             return self.note_error_in(diagnostic.file);
         }
