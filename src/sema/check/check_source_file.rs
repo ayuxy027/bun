@@ -455,6 +455,7 @@ impl<'s> Checker<'_, 's> {
         self.check_type_node(file, decl.default);
         let ty = self.type_param(file, tp);
         self.base_constraint(ty);
+        self.check_circular_constraint(file, tp);
         self.check_type_parameter_default(file, tp, ty);
         self.check_type_name_is_reserved(file, tp, decl.name, 2368);
     }

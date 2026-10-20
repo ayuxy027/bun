@@ -15,7 +15,6 @@ impl Checker<'_, '_> {
     pub(super) fn check_circularities(&mut self, file: FileId) {
         self.check_circular_resolutions(file);
         let (hir, bound) = (self.hir(file), self.bound(file));
-        let unchecked = self.unchecked_jsdoc_types(file);
         // `checkClassLikeDeclaration`, `checkInterfaceDeclaration`
         for c in 0..hir.classes.len() {
             if bound.class_symbol[c].is_some() && !self.is_never_checked(hir.classes[c].start) {
@@ -28,33 +27,59 @@ impl Checker<'_, '_> {
             let own = self.files().sym(file, symbol);
             self.base_types(own);
         }
-        for p in 0..hir.type_params.len() {
-            let constraint = hir.type_params[p].constraint;
-            if constraint.is_none()
-                || bound.type_param_scope[p].is_none()
-                || bound.type_param_symbol[p].is_none()
-                || unchecked.contain(hir[constraint].pos)
-            {
-                continue;
-            }
-            let own = TypeParamId(p as u32);
-            // `getConstraintDeclaration`: the declarations of a class or an interface declare one
-            // type parameter.
-            let (of, declaration, _) =
-                self.type_param_declaration_with(file, own, |it: &TypeParam| it.constraint);
-            if (of, declaration) != (file, own) {
-                continue;
-            }
-            let param = self.type_param(file, own);
-            if !self.has_non_circular_base_constraint(param) {
-                let start = start_of_type(hir, constraint);
-                let end = self.end_of_type_node_from(file, constraint, start);
-                let name = self.atom_text(hir.type_params[p].name);
-                let related = self.origin_of_circular_constraint(param, file, constraint);
-                self.error_at((file, start, end), 2313, &[Arg::Bytes(&name)])
-                    .related_information
-                    .extend(related);
-            }
+    }
+
+    /// `getResolvedBaseConstraint`: 2313 for the type parameter `own` of `file`, whose base constraint `checkTypeParameter` has
+    /// just asked for. Whichever resolution found the cycle, the check of the declaration reports it.
+    pub(super) fn check_circular_constraint(&mut self, file: FileId, own: TypeParamId) {
+        let (hir, bound) = (self.hir(file), self.bound(file));
+        let constraint = hir[own].constraint;
+        if constraint.is_none()
+            || bound.type_param_scope[own.idx()].is_none()
+            || bound.type_param_symbol[own.idx()].is_none()
+        {
+            return;
+        }
+        // `getConstraintDeclaration`: the declarations of a class or an interface declare one
+        // type parameter.
+        let (of, declaration, _) =
+            self.type_param_declaration_with(file, own, |it: &TypeParam| it.constraint);
+        if (of, declaration) != (file, own) {
+            return;
+        }
+        let param = self.type_param(file, own);
+        if !self.has_non_circular_base_constraint(param) {
+            let err = self.circular_constraint_error(param, file, own);
+            self.add_diagnostic(err);
+        }
+    }
+
+    /// 2313 at the constraint of the type parameter `own` of `file`, whose type is `param`.
+    fn circular_constraint_error(&mut self, param: TypeId, file: FileId, own: TypeParamId) -> Reported {
+        let hir = self.hir(file);
+        let constraint = hir[own].constraint;
+        let start = start_of_type(hir, constraint);
+        let end = self.end_of_type_node_from(file, constraint, start);
+        let name = self.atom_text(hir[own].name);
+        let mut err = self.new_diagnostic((file, start, end), 2313, &[Arg::Bytes(&name)]);
+        let related = self.origin_of_circular_constraint(param, file, constraint);
+        err.related_information.extend(related);
+        err
+    }
+
+    /// `getResolvedBaseConstraint`: 2313 for the type parameter `param`, where a cycle has just closed around the resolution of its
+    /// base constraint and no `checkTypeParameter` visits the declaration: see `is_resolved_on_request_at`.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn report_circular_constraint_on_request(&mut self, param: TypeId) {
+        let TypeData::TypeParam(file, tp, _) = *self.data(param) else {
+            return;
+        };
+        let (of, own, _) = self.type_param_declaration_with(file, tp, |it: &TypeParam| it.constraint);
+        let constraint = self.hir(of)[own].constraint;
+        if constraint.is_some() && self.is_resolved_on_request_at(of, self.hir(of)[constraint].pos) {
+            let err = self.circular_constraint_error(param, of, own);
+            self.add_diagnostic_of(Some(Query::TypeNode(of, constraint)), err);
         }
     }
 
