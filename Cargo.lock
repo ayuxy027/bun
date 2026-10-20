@@ -1960,7 +1960,6 @@ name = "bun_url"
 version = "0.0.0"
 dependencies = [
  "bun_alloc",
- "bun_collections",
  "bun_core",
  "bun_opaque",
  "bun_paths",

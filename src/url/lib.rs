@@ -3,14 +3,11 @@
 pub mod error;
 pub use error::{Error, Result};
 
-use core::cell::RefCell;
 use core::mem::MaybeUninit;
 
-use bun_collections::bit_set::{ArrayBitSet, num_masks_for};
 use bun_core::{self, fmt as bun_fmt};
 use bun_core::{String as BunString, Tag as BunStringTag, strings};
 use bun_paths::resolve_path::{self, platform};
-use bun_wyhash::hash as wyhash;
 
 // `bun.schema.api.StringPointer` — canonical definition lives in `bun_core`
 // (T0, already a dep). Re-exported under `api::` so `QueryStringMap` /
@@ -970,17 +967,21 @@ pub use bun_core::ip_address::strip_ipv6_brackets;
 // QueryStringMap & friends
 // ══════════════════════════════════════════════════════════════════════════
 
+/// A name and its value: two ranges of the bytes of a [`QueryStringMap`]. The name is text.
 #[derive(Clone, Copy)]
 pub struct Param {
     pub(crate) name: api::StringPointer,
-    pub(crate) name_hash: u64,
     pub(crate) value: api::StringPointer,
+    /// The next pair of this name, or 0.
+    pub(crate) next: u32,
+    /// A pair before this one has this name.
+    pub(crate) again: bool,
 }
 
 // Vec<Param> (AoS); SoA would be a perf optimization only.
 pub(crate) type ParamList = Vec<Param>;
 
-/// QueryString array-backed hash table that does few allocations and preserves the original order
+/// The pairs of a route's parameters, then of a query string: decoded, in the order they came. The pairs of one name are linked.
 pub struct QueryStringMap {
     // Allocator field dropped — global mimalloc per PORTING.md.
     // `slice` is self-referential (points into `buffer`) when decoding
@@ -988,7 +989,7 @@ pub struct QueryStringMap {
     slice: *const [u8],
     pub(crate) buffer: Vec<u8>,
     pub(crate) list: ParamList,
-    pub(crate) name_count: Option<usize>,
+    pub(crate) name_count: usize,
 }
 
 impl Clone for QueryStringMap {
@@ -1018,34 +1019,20 @@ impl Clone for QueryStringMap {
     }
 }
 
-thread_local! {
-    // Unused in current code (commented-out path in get_name_count).
-    static NAME_COUNT_BUF: RefCell<[*const [u8]; 8]> = const { RefCell::new([std::ptr::from_ref::<[u8]>(&[]); 8]) };
-}
-
 impl QueryStringMap {
-    pub fn get_name_count(&self) -> usize {
-        self.list.len()
-        // if (this.name_count == null) {
-        //     var count: usize = 0;
-        //     var iterate = this.iter();
-        //     while (iterate.next(&_name_count) != null) {
-        //         count += 1;
-        //     }
-        //     this.name_count = count;
-        // }
-        // return this.name_count.?;
+    /// Each name once, in the order of its first pair, with the values of its pairs in the order of the URL.
+    pub fn names(&self) -> Names<'_> {
+        Names {
+            map: self,
+            pairs: self.list.iter(),
+            left: self.name_count,
+        }
     }
 
-    pub fn iter(&self) -> Iterator<'_> {
-        Iterator::init(self)
-    }
-
-    pub(crate) fn str(&self, ptr: api::StringPointer) -> &[u8] {
+    fn bytes(&self) -> &[u8] {
         // SAFETY: `slice` is valid for the lifetime of `self` (either borrows
         // `self.buffer` or an external query_string the caller keeps alive).
-        let slice = unsafe { &*self.slice };
-        &slice[ptr.offset as usize..ptr.offset as usize + ptr.length as usize]
+        unsafe { &*self.slice }
     }
 
     pub fn init_with_scanner(
@@ -1056,28 +1043,17 @@ impl QueryStringMap {
         let mut estimated_str_len: usize = 0;
         let mut count: usize = 0;
 
-        let mut nothing_needs_decoding = true;
-
         while let Some(result) = scanner.pathname.next() {
-            if result.name_needs_decoding || result.value_needs_decoding {
-                nothing_needs_decoding = false;
-            }
             estimated_str_len += result.name.length as usize + result.value.length as usize;
             count += 1;
         }
 
         debug_assert!(count > 0); // We should not call initWithScanner when there are no path params
 
-        while count < MAX_QUERY_STRING_PARAMS {
-            let Some(result) = scanner.query.next() else {
-                break;
-            };
-            if result.name_needs_decoding || result.value_needs_decoding {
-                nothing_needs_decoding = false;
-            }
-            estimated_str_len += result.name.length as usize + result.value.length as usize;
-            count += 1;
-        }
+        let query_string = scanner.query.query_string;
+        // The copy of the query string, and room for each part of it that is decoded.
+        estimated_str_len += query_string.len() * if has_escape(query_string) { 2 } else { 1 };
+        count += pair_count_at_most(query_string);
 
         if count == 0 {
             return Ok(None);
@@ -1089,166 +1065,80 @@ impl QueryStringMap {
         // this over-allocates
         // TODO: refactor this to support multiple slices instead of copying the whole thing
         let mut buf: Vec<u8> = Vec::with_capacity(estimated_str_len);
-        let mut buf_writer_pos: u32 = 0;
+        let (mut slots, mut more_slots) = ([0; SHORT_NAME_TABLE], Vec::new());
+        let mut names = NameLinks::new(count, &mut slots, &mut more_slots);
 
         while let Some(result) = scanner.pathname.next() {
             if list.len() >= MAX_QUERY_STRING_PARAMS {
                 break;
             }
-            let mut name = result.name;
-            let mut value = result.value;
-            let name_slice = result.raw_name(scanner.pathname.routename);
-
-            name.length = u32::try_from(name_slice.len()).unwrap();
-            name.offset = buf_writer_pos;
-            buf.extend_from_slice(name_slice);
-            buf_writer_pos += u32::try_from(name_slice.len()).unwrap();
-
-            let name_hash: u64 = wyhash(name_slice);
-
-            let value_slice = result.raw_value(scanner.pathname.pathname);
-            value.length = u32::try_from(value_slice.len()).unwrap();
-            value.offset = buf_writer_pos;
-            buf.extend_from_slice(value_slice);
-            buf_writer_pos += value.length;
-
-            list.push(Param {
-                name,
-                value,
-                name_hash,
-            });
+            let name = append(&mut buf, result.raw_name(scanner.pathname.routename));
+            let name = text_of(&mut buf, name);
+            let value = append(&mut buf, result.raw_value(scanner.pathname.pathname));
+            let slot = names.slot(name.slice(&buf), &list, &buf);
+            names.push(&mut list, slot, name, value);
         }
 
-        let route_parameter_begin = list.len();
+        let route_parameter_count = list.len();
+        let query = QueryCopy::append(&mut buf, query_string);
 
         while let Some(result) = scanner.query.next() {
             if list.len() >= MAX_QUERY_STRING_PARAMS {
                 break;
             }
-            let mut name = result.name;
-            let mut value = result.value;
-            let name_hash: u64;
-            if result.name_needs_decoding {
-                name.length = match PercentEncoding::decode(
-                    &mut buf,
-                    &scanner.query.query_string[name.offset as usize..][..name.length as usize],
-                ) {
-                    Ok(n) => n,
-                    Err(_) => {
-                        buf.truncate(buf_writer_pos as usize);
-                        continue;
-                    }
-                };
-                name.offset = buf_writer_pos;
-                buf_writer_pos += name.length;
-                name_hash = wyhash(&buf[name.offset as usize..][..name.length as usize]);
-                if let Some(index) = list.iter().position(|p| p.name_hash == name_hash) {
-                    if index < route_parameter_begin {
-                        continue;
-                    }
-
-                    name = list[index].name;
-                }
-            } else {
-                name_hash = wyhash(result.raw_name(scanner.query.query_string));
-                if let Some(index) = list.iter().position(|p| p.name_hash == name_hash) {
-                    // query string parameters should not override route parameters
-                    // see https://nextjs.org/docs/routing/dynamic-routes
-                    if index < route_parameter_begin {
-                        continue;
-                    }
-
-                    name = list[index].name;
-                } else {
-                    name.length = match PercentEncoding::decode(
-                        &mut buf,
-                        &scanner.query.query_string[name.offset as usize..][..name.length as usize],
-                    ) {
-                        Ok(n) => n,
-                        Err(_) => {
-                            buf.truncate(buf_writer_pos as usize);
-                            continue;
-                        }
-                    };
-                    name.offset = buf_writer_pos;
-                    buf_writer_pos += name.length;
-                }
-            }
-
-            value.length = match PercentEncoding::decode(
-                &mut buf,
-                &scanner.query.query_string[value.offset as usize..][..value.length as usize],
-            ) {
-                Ok(n) => n,
-                Err(_) => {
-                    buf.truncate(buf_writer_pos as usize);
-                    continue;
-                }
+            let decoded_start = buf.len();
+            let Some(name) = query.name(&mut buf, result.name, result.name_needs_decoding) else {
+                continue;
             };
-            value.offset = buf_writer_pos;
-            buf_writer_pos += value.length;
-
-            list.push(Param {
-                name,
-                value,
-                name_hash,
-            });
+            let slot = names.slot(name.slice(&buf), &list, &buf);
+            // A route parameter hides a query pair of its name: https://nextjs.org/docs/routing/dynamic-routes
+            if names
+                .last(slot)
+                .is_some_and(|last| last < route_parameter_count)
+            {
+                buf.truncate(decoded_start);
+                continue;
+            }
+            let Some(value) = query.decoded(&mut buf, result.value, result.value_needs_decoding)
+            else {
+                buf.truncate(decoded_start);
+                continue;
+            };
+            names.push(&mut list, slot, name, value);
         }
 
-        // buf.expandToCapacity() — Vec doesn't expose this; not needed since we slice by buf_writer_pos
-        let _ = nothing_needs_decoding;
-        let slice_ptr: *const [u8] = &raw const buf[0..buf_writer_pos as usize];
+        let name_count = names.name_count;
+        let slice_ptr: *const [u8] = &raw const buf[..];
         Ok(Some(QueryStringMap {
             list,
             buffer: buf,
             slice: slice_ptr,
-            name_count: None,
+            name_count,
         }))
     }
 
     pub fn init(query_string: &[u8]) -> Result<Option<QueryStringMap>, bun_alloc::AllocError> {
-        let mut list = ParamList::default();
-
         let mut scanner = Scanner::init(query_string);
-        let mut count: usize = 0;
-        let mut estimated_str_len: usize = 0;
-
-        let mut nothing_needs_decoding = true;
-        while count < MAX_QUERY_STRING_PARAMS {
-            let Some(result) = scanner.next() else {
-                break;
-            };
-            if result.name_needs_decoding || result.value_needs_decoding {
-                nothing_needs_decoding = false;
-            }
-            estimated_str_len += result.name.length as usize + result.value.length as usize;
-            count += 1;
-        }
-
-        if count == 0 {
+        let mut pairs = core::iter::from_fn(|| scanner.next()).peekable();
+        if pairs.peek().is_none() {
             return Ok(None);
         }
 
-        scanner = Scanner::init(query_string);
-        list.reserve(count);
+        let count = pair_count_at_most(query_string);
+        let mut list = ParamList::with_capacity(count);
+        let (mut slots, mut more_slots) = ([0; SHORT_NAME_TABLE], Vec::new());
+        let mut names = NameLinks::new(count, &mut slots, &mut more_slots);
 
-        if nothing_needs_decoding {
-            scanner = Scanner::init(query_string);
-            while let Some(result) = scanner.next() {
+        if !has_escape(query_string) && is_text(query_string) {
+            for result in pairs {
                 if list.len() >= MAX_QUERY_STRING_PARAMS {
                     break;
                 }
                 debug_assert!(!result.name_needs_decoding);
                 debug_assert!(!result.value_needs_decoding);
 
-                let name = result.name;
-                let value = result.value;
-                let name_hash: u64 = wyhash(result.raw_name(query_string));
-                list.push(Param {
-                    name,
-                    value,
-                    name_hash,
-                });
+                let slot = names.slot(result.name.slice(query_string), &list, query_string);
+                names.push(&mut list, slot, result.name, result.value);
             }
 
             return Ok(Some(QueryStringMap {
@@ -1256,170 +1146,297 @@ impl QueryStringMap {
                 buffer: Vec::new(),
                 // `slice` borrows the caller's query_string; lifetime not tracked here
                 slice: std::ptr::from_ref::<[u8]>(query_string),
-                name_count: None,
+                name_count: names.name_count,
             }));
         }
 
-        let mut buf: Vec<u8> = Vec::with_capacity(estimated_str_len);
-        let mut buf_writer_pos: u32 = 0;
+        let mut buf: Vec<u8> = Vec::with_capacity(query_string.len() * 2);
+        let query = QueryCopy::append(&mut buf, query_string);
 
-        // Re-slice per iteration to avoid holding a borrow across push().
-        while let Some(result) = scanner.next() {
+        for result in pairs {
             if list.len() >= MAX_QUERY_STRING_PARAMS {
                 break;
             }
-            let mut name = result.name;
-            let mut value = result.value;
-            let name_hash: u64;
-            if result.name_needs_decoding {
-                name.length = match PercentEncoding::decode(
-                    &mut buf,
-                    &query_string[name.offset as usize..][..name.length as usize],
-                ) {
-                    Ok(n) => n,
-                    Err(_) => {
-                        buf.truncate(buf_writer_pos as usize);
-                        continue;
-                    }
-                };
-                name.offset = buf_writer_pos;
-                buf_writer_pos += name.length;
-                name_hash = wyhash(&buf[name.offset as usize..][..name.length as usize]);
-            } else {
-                name_hash = wyhash(result.raw_name(query_string));
-                if let Some(index) = list.iter().position(|p| p.name_hash == name_hash) {
-                    name = list[index].name;
-                } else {
-                    name.length = match PercentEncoding::decode(
-                        &mut buf,
-                        &query_string[name.offset as usize..][..name.length as usize],
-                    ) {
-                        Ok(n) => n,
-                        Err(_) => {
-                            buf.truncate(buf_writer_pos as usize);
-                            continue;
-                        }
-                    };
-                    name.offset = buf_writer_pos;
-                    buf_writer_pos += name.length;
-                }
-            }
-
-            value.length = match PercentEncoding::decode(
-                &mut buf,
-                &query_string[value.offset as usize..][..value.length as usize],
-            ) {
-                Ok(n) => n,
-                Err(_) => {
-                    buf.truncate(buf_writer_pos as usize);
-                    continue;
-                }
+            let decoded_start = buf.len();
+            let Some(name) = query.name(&mut buf, result.name, result.name_needs_decoding) else {
+                continue;
             };
-            value.offset = buf_writer_pos;
-            buf_writer_pos += value.length;
-
-            list.push(Param {
-                name,
-                value,
-                name_hash,
-            });
+            let Some(value) = query.decoded(&mut buf, result.value, result.value_needs_decoding)
+            else {
+                buf.truncate(decoded_start);
+                continue;
+            };
+            let slot = names.slot(name.slice(&buf), &list, &buf);
+            names.push(&mut list, slot, name, value);
         }
 
-        let slice_ptr: *const [u8] = &raw const buf[0..buf_writer_pos as usize];
+        let name_count = names.name_count;
+        let slice_ptr: *const [u8] = &raw const buf[..];
         Ok(Some(QueryStringMap {
             list,
             buffer: buf,
             slice: slice_ptr,
-            name_count: None,
+            name_count,
         }))
     }
 }
 
 // Browsers typically limit URL lengths to around 64k.
-// IntegerBitSet caps at ≤64 bits, so pick ArrayBitSet directly. 2048 / 64 == 32 masks.
 /// Hard cap on parsed query-string parameters, enforced in `init` /
-/// `init_with_scanner` so the fixed-size `VisitedMap` bitset is never indexed
-/// out of bounds.
+/// `init_with_scanner`.
 const MAX_QUERY_STRING_PARAMS: usize = 2048;
-type VisitedMap = ArrayBitSet<MAX_QUERY_STRING_PARAMS, { num_masks_for(MAX_QUERY_STRING_PARAMS) }>;
 
-pub struct Iterator<'a> {
-    pub(crate) i: usize,
-    pub(crate) map: &'a QueryStringMap,
-    pub(crate) visited: VisitedMap,
+/// Whether a name or a value of `query_string` can need decoding.
+fn has_escape(query_string: &[u8]) -> bool {
+    strings::index_of_any(query_string, b"%+").is_some()
 }
 
-pub struct IteratorResult<'a, 't> {
-    pub name: &'a [u8],
-    pub values: &'t mut [&'a [u8]],
+/// The most pairs that `query_string` can have.
+fn pair_count_at_most(query_string: &[u8]) -> usize {
+    if query_string.is_empty() {
+        return 0;
+    }
+    (strings::count_char(query_string, b'&') + 1).min(MAX_QUERY_STRING_PARAMS)
 }
 
-impl<'a> Iterator<'a> {
-    pub(crate) fn init(map: &'a QueryStringMap) -> Iterator<'a> {
-        debug_assert!(map.list.len() <= MAX_QUERY_STRING_PARAMS);
-        Iterator {
-            i: 0,
-            map,
-            visited: VisitedMap::init_empty(),
+/// The names of a [`QueryStringMap`].
+pub struct Names<'a> {
+    map: &'a QueryStringMap,
+    pairs: core::slice::Iter<'a, Param>,
+    left: usize,
+}
+
+impl<'a> Iterator for Names<'a> {
+    type Item = (&'a [u8], Values<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let first = self.pairs.find(|pair| !pair.again)?;
+        self.left -= 1;
+        let values = Values {
+            map: self.map,
+            pair: Some(first),
+        };
+        Some((first.name.slice(self.map.bytes()), values))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+/// The values of the pairs of one name.
+pub struct Values<'a> {
+    map: &'a QueryStringMap,
+    pair: Option<&'a Param>,
+}
+
+impl<'a> Values<'a> {
+    /// The value of a name that has one pair.
+    pub fn only(&self) -> Option<&'a [u8]> {
+        let pair = self.pair.filter(|pair| pair.next == 0)?;
+        Some(pair.value.slice(self.map.bytes()))
+    }
+}
+
+impl<'a> Iterator for Values<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let pair = self.pair?;
+        self.pair = match pair.next {
+            0 => None,
+            next => self.map.list.get(next as usize),
+        };
+        Some(pair.value.slice(self.map.bytes()))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let mut count = 0;
+        let mut pair = self.pair;
+        while let Some(this) = pair {
+            count += 1;
+            pair = match this.next {
+                0 => None,
+                next => self.map.list.get(next as usize),
+            };
+        }
+        (count, Some(count))
+    }
+}
+
+/// Links the pairs of one name as they enter the list. A name is text, so the same bytes are the same property key.
+struct NameLinks<'a> {
+    /// Open addressing: the last pair of a name, plus one, at the hash of the name.
+    last_of_name: &'a mut [u32],
+    /// The most pairs that the list can have. A list of one pair has no name to find.
+    pair_count: usize,
+    seed: u64,
+    name_count: usize,
+}
+
+/// The table of [`NameLinks`] for a list of at most 32 pairs is on the stack.
+const SHORT_NAME_TABLE: usize = 64;
+
+impl<'a> NameLinks<'a> {
+    fn new(
+        pair_count: usize,
+        short: &'a mut [u32; SHORT_NAME_TABLE],
+        long: &'a mut Vec<u32>,
+    ) -> Self {
+        let size = (pair_count * 2).next_power_of_two();
+        let last_of_name = if size <= SHORT_NAME_TABLE {
+            &mut short[..size]
+        } else {
+            long.resize(size, 0);
+            &mut long[..]
+        };
+        Self {
+            last_of_name,
+            pair_count,
+            // Names cannot be made ahead of time to have one slot.
+            seed: if pair_count > 1 {
+                bun_core::fast_random()
+            } else {
+                0
+            },
+            name_count: 0,
         }
     }
 
-    // Lifetimes: values borrow `target` ('t), name borrows `map.slice` ('a).
-    pub fn next<'t>(&mut self, target: &'t mut [&'a [u8]]) -> Option<IteratorResult<'a, 't>>
-    where
-        'a: 't,
-    {
-        while self.i < self.map.list.len() && self.visited.is_set(self.i) {
-            self.i += 1;
+    /// The slot of `name`: the one that has the last pair of this name, or an empty one.
+    fn slot(&self, name: &[u8], list: &[Param], bytes: &[u8]) -> usize {
+        if self.pair_count <= 1 {
+            return 0;
         }
-        if self.i >= self.map.list.len() {
+        let mask = self.last_of_name.len() - 1;
+        let mut slot = bun_wyhash::hash_with_seed(self.seed, name) as usize & mask;
+        while let Some(last) = self.last(slot) {
+            if strings::eql(list[last].name.slice(bytes), name) {
+                break;
+            }
+            slot = (slot + 1) & mask;
+        }
+        slot
+    }
+
+    /// The last pair of the name of `slot`.
+    fn last(&self, slot: usize) -> Option<usize> {
+        (self.last_of_name[slot] as usize).checked_sub(1)
+    }
+
+    /// Adds a pair to `list`, after the last pair of its name. `slot` is the slot of its name.
+    fn push(
+        &mut self,
+        list: &mut ParamList,
+        slot: usize,
+        name: api::StringPointer,
+        value: api::StringPointer,
+    ) {
+        let index = u32::try_from(list.len()).unwrap();
+        let last = self.last(slot);
+        match last {
+            Some(last) => list[last].next = index,
+            None => self.name_count += 1,
+        }
+        self.last_of_name[slot] = index + 1;
+        list.push(Param {
+            name,
+            value,
+            next: 0,
+            again: last.is_some(),
+        });
+    }
+}
+
+/// Appends `bytes` to `buf`.
+fn append(buf: &mut Vec<u8>, bytes: &[u8]) -> api::StringPointer {
+    let offset = u32::try_from(buf.len()).unwrap();
+    buf.extend_from_slice(bytes);
+    api::StringPointer {
+        offset,
+        length: u32::try_from(bytes.len()).unwrap(),
+    }
+}
+
+/// Whether `bytes` are UTF-8.
+fn is_text(bytes: &[u8]) -> bool {
+    bytes.is_ascii() || (bytes.utf8_chunks().next()).is_none_or(|chunk| chunk.invalid().is_empty())
+}
+
+/// Makes `name`, a range of `buf`, text: each part of it that is not UTF-8 is U+FFFD, as in the string that JavaScript reads.
+fn text_of(buf: &mut Vec<u8>, name: api::StringPointer) -> api::StringPointer {
+    if is_text(name.slice(buf)) {
+        return name;
+    }
+    let text = buf.len();
+    let (mut at, end) = (name.offset as usize, (name.offset + name.length) as usize);
+    while let Some(chunk) = buf[at..end].utf8_chunks().next() {
+        let (valid, invalid) = (chunk.valid().len(), chunk.invalid().len());
+        buf.extend_from_within(at..at + valid);
+        if invalid != 0 {
+            buf.extend_from_slice("\u{FFFD}".as_bytes());
+        }
+        at += valid + invalid;
+    }
+    api::StringPointer {
+        offset: u32::try_from(text).unwrap(),
+        length: u32::try_from(buf.len() - text).unwrap(),
+    }
+}
+
+/// A copy of the query string in the buffer of a [`QueryStringMap`]. A name or a value that needs no decoding is a range of the copy.
+struct QueryCopy<'a> {
+    query_string: &'a [u8],
+    /// Where the copy starts in the buffer.
+    start: u32,
+    /// Every name that needs no decoding is text.
+    is_text: bool,
+}
+
+impl<'a> QueryCopy<'a> {
+    fn append(buf: &mut Vec<u8>, query_string: &'a [u8]) -> Self {
+        Self {
+            query_string,
+            start: append(buf, query_string).offset,
+            is_text: is_text(query_string),
+        }
+    }
+
+    /// As [`Self::decoded`], for a name: the name is made text.
+    fn name(
+        &self,
+        buf: &mut Vec<u8>,
+        part: api::StringPointer,
+        needs_decoding: bool,
+    ) -> Option<api::StringPointer> {
+        let name = self.decoded(buf, part, needs_decoding)?;
+        if self.is_text && !needs_decoding {
+            return Some(name);
+        }
+        Some(text_of(buf, name))
+    }
+
+    /// Where `part` of the query string is in `buf`: in the copy, or decoded at the end of `buf`. `None`, with `buf` as it was: a `%` of `part` is not an escape.
+    fn decoded(
+        &self,
+        buf: &mut Vec<u8>,
+        part: api::StringPointer,
+        needs_decoding: bool,
+    ) -> Option<api::StringPointer> {
+        if !needs_decoding {
+            return Some(api::StringPointer {
+                offset: self.start + part.offset,
+                length: part.length,
+            });
+        }
+        let offset = buf.len();
+        if PercentEncoding::decode(buf, part.slice(self.query_string)).is_err() {
+            buf.truncate(offset);
             return None;
         }
-
-        let list = &self.map.list;
-        let hash = list[self.i].name_hash;
-        let name_slice = list[self.i].name;
-        debug_assert!(name_slice.length > 0);
-        let name = self.map.str(name_slice);
-        target[0] = self.map.str(list[self.i].value);
-
-        self.visited.set(self.i);
-        self.i += 1;
-
-        let remainder = &list[self.i..];
-
-        let mut target_i: usize = 1;
-        let mut current_i: usize = 0;
-
-        while let Some(next_index) = remainder[current_i..]
-            .iter()
-            .position(|p| p.name_hash == hash)
-        {
-            let real_i = current_i + next_index + self.i;
-            debug_assert!(!self.visited.is_set(real_i));
-
-            self.visited.set(real_i);
-            target[target_i] = self.map.str(remainder[current_i + next_index].value);
-            target_i += 1;
-
-            current_i += next_index + 1;
-            if target_i >= target.len() {
-                return Some(IteratorResult {
-                    name,
-                    values: &mut target[0..target_i],
-                });
-            }
-            if real_i + 1 >= self.map.list.len() {
-                return Some(IteratorResult {
-                    name,
-                    values: &mut target[0..target_i],
-                });
-            }
-        }
-
-        Some(IteratorResult {
-            name,
-            values: &mut target[0..target_i],
+        Some(api::StringPointer {
+            offset: u32::try_from(offset).unwrap(),
+            length: u32::try_from(buf.len() - offset).unwrap(),
         })
     }
 }
@@ -1825,7 +1842,7 @@ impl<'a> Scanner<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::URL;
+    use super::{CombinedScanner, QueryStringMap, URL, route_param};
 
     const ORIGIN: &[u8] = b"http://localhost:3000";
 
@@ -1967,5 +1984,146 @@ mod tests {
         expected.extend_from_slice(&basename);
         expected.extend_from_slice(b".js");
         assert_eq!(join(b"", b"dir", &basename, b".js"), expected);
+    }
+
+    fn names_and_values(map: &QueryStringMap) -> Vec<(&[u8], Vec<&[u8]>)> {
+        let names = map.names();
+        assert_eq!(names.size_hint(), (map.name_count, Some(map.name_count)));
+        names
+            .map(|(name, values)| {
+                let (count, _) = values.size_hint();
+                let only = values.only();
+                let values: Vec<&[u8]> = values.collect();
+                assert_eq!(values.len(), count);
+                assert_eq!(only, (count == 1).then(|| values[0]));
+                (name, values)
+            })
+            .collect()
+    }
+
+    fn query_map(query: &[u8]) -> QueryStringMap {
+        QueryStringMap::init(query)
+            .expect("the allocation does not fail")
+            .expect("the query has pairs")
+    }
+
+    /// The map of `query` on a route that has the parameter `name`, and that matched the path `7`.
+    fn route_map(name: &[u8], query: &[u8]) -> QueryStringMap {
+        let route = [b"[", name, b"]"].concat();
+        let pathname = b"7";
+        let params: route_param::List = vec![route_param::Param {
+            name: &route[1..route.len() - 1],
+            value: pathname,
+        }];
+        QueryStringMap::init_with_scanner(CombinedScanner::init(query, pathname, &route, &params))
+            .expect("the allocation does not fail")
+            .expect("the route has a parameter")
+    }
+
+    #[test]
+    fn a_name_comes_once_with_its_values_in_the_order_of_the_query() {
+        // The map borrows the first query. A "+" or an escape makes it copy every pair.
+        for (query, value_of_b) in [
+            (&b"a=1&b=2&a=3&c&a=4"[..], &b"2"[..]),
+            (b"a=1&%62=x+y&a=3&c&a=4", b"x+y"),
+        ] {
+            assert_eq!(
+                names_and_values(&query_map(query)),
+                [
+                    (&b"a"[..], vec![&b"1"[..], b"3", b"4"]),
+                    (b"b", vec![value_of_b]),
+                    (b"c", vec![b""])
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_has_every_one_of_its_values() {
+        for count in [256, 257, super::MAX_QUERY_STRING_PARAMS] {
+            let query = vec![&b"tag=v"[..]; count].join(&b'&');
+            assert_eq!(
+                names_and_values(&query_map(&query)),
+                [(&b"tag"[..], vec![&b"v"[..]; count])]
+            );
+        }
+    }
+
+    #[test]
+    fn two_names_that_have_one_wyhash_are_two_names() {
+        let first = b"rs5rgaaaprefixedaaaaaaaa38zu8ai7yyyyyyyy";
+        let second = b"rs5rgaaaprefixedbbbbbbbb38zu8ai7yyyyyyyy";
+        assert_eq!(bun_wyhash::hash(first), bun_wyhash::hash(second));
+        let query = [&first[..], b"=1&", second, b"=2&", first, b"=3"].concat();
+        assert_eq!(
+            names_and_values(&query_map(&query)),
+            [(&first[..], vec![&b"1"[..], b"3"]), (second, vec![b"2"])]
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_utf8_is_the_text_that_javascript_reads() {
+        let key = "\u{FFFD}".as_bytes();
+        // The router decodes the URL before the map decodes each name, so a name comes with or without an escape.
+        for query in [
+            &b"\xFF=1&\xFE=2&a\xFFb=3&\xE2\x82=4&\xEF\xBF\xBD=5&\xC3\xA9=6&\xFF\xFF=7"[..],
+            b"%FF=1&%FE=2&a%FFb=3&%E2%82=4&%EF%BF%BD=5&%C3%A9=6&%FF%FF=7",
+            b"\xFF=1&%FE=2&a\xFFb=3&%E2%82=4&\xEF\xBF\xBD=5&%C3%A9=6&\xFF%FF=7",
+        ] {
+            assert_eq!(
+                names_and_values(&query_map(query)),
+                [
+                    (key, vec![&b"1"[..], b"2", b"4", b"5"]),
+                    ("a\u{FFFD}b".as_bytes(), vec![b"3"]),
+                    ("\u{e9}".as_bytes(), vec![b"6"]),
+                    ("\u{FFFD}\u{FFFD}".as_bytes(), vec![b"7"])
+                ]
+            );
+        }
+        // A value stays the bytes that came.
+        assert_eq!(
+            names_and_values(&query_map(b"a=\xFF&a=%FE")),
+            [(&b"a"[..], vec![&b"\xFF"[..], b"\xFE"])]
+        );
+    }
+
+    #[test]
+    fn a_pair_with_an_escape_that_is_not_one_is_dropped() {
+        assert_eq!(
+            names_and_values(&query_map(b"a=1&b%zz=2&c=%zz&d=4+&a=5")),
+            [(&b"a"[..], vec![&b"1"[..], b"5"]), (b"d", vec![b"4+"])]
+        );
+    }
+
+    #[test]
+    fn a_route_parameter_comes_first_and_hides_a_query_pair_of_its_name() {
+        assert_eq!(
+            names_and_values(&route_map(b"id", b"a=1&id=8&%69d=9&b=2&a=3")),
+            [
+                (&b"id"[..], vec![&b"7"[..]]),
+                (b"a", vec![b"1", b"3"]),
+                (b"b", vec![b"2"])
+            ]
+        );
+        // A name that is not UTF-8 hides the names that JavaScript reads as the same text.
+        assert_eq!(
+            names_and_values(&route_map(b"\xFF", b"x=1&%FE=q&\xFF=r&%EF%BF%BD=s&x=2")),
+            [
+                ("\u{FFFD}".as_bytes(), vec![&b"7"[..]]),
+                (b"x", vec![b"1", b"2"])
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hidden_query_pair_takes_no_place_under_the_limit() {
+        for hidden in [&b"id=0"[..], b"%69d=0"] {
+            let mut query = vec![hidden; super::MAX_QUERY_STRING_PARAMS + 1].join(&b'&');
+            query.extend_from_slice(b"&x=1");
+            assert_eq!(
+                names_and_values(&route_map(b"id", &query)),
+                [(&b"id"[..], vec![&b"7"[..]]), (b"x", vec![b"1"])]
+            );
+        }
     }
 }
