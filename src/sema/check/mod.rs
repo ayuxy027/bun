@@ -216,6 +216,10 @@ pub struct Program<'s> {
     /// has reported. A union: it does not depend on which task comes first.
     /// Tasks write to this set and the next one directly.
     properties_referenced_before: Guarded<crate::util::FxHashSet<Sym>>,
+    /// The type references below the type arguments of an import type that a task has resolved, under `noUnusedLocals`
+    /// or `noUnusedParameters`. `checkImportType` checks nothing there, so a name is used once something asks for the
+    /// type: see `UnusedOnRequest`. A union, like the set above.
+    references_resolved_on_request: Guarded<crate::util::FxHashSet<(FileId, TypeNodeId)>>,
     /// What `check_external_emit_helpers_of_later_files` has reported, of all tasks. `finish_file`
     /// keeps the first of each. It does not depend on which task comes first.
     emit_helper_errors_of_earlier_files: Guarded<Vec<errors_emit_helpers::EarlierEmitHelperError>>,
@@ -572,6 +576,7 @@ impl<'s> Program<'s> {
             commits: commit::Commits::new_in(session.arena())
                 .for_files(files.ranks(), session.arena()),
             properties_referenced_before: Default::default(),
+            references_resolved_on_request: Default::default(),
             emit_helper_errors_of_earlier_files: Default::default(),
             auto_array_type,
             package_names_of_linked_files: Default::default(),
@@ -871,6 +876,7 @@ impl<'s> Program<'s> {
             reported: Vec::new(),
             is_checking_in_flow_loop: false,
             never_checked: Default::default(),
+            unchecked_type_arguments: Vec::new(),
             never_in_progress: Vec::new(),
             reduced_unions: Default::default(),
             union_members: Default::default(),
@@ -943,6 +949,7 @@ impl<'s> Program<'s> {
             referenced_properties: Default::default(),
             tracked_names: Vec::new(),
             unused_private_members: Vec::new(),
+            unused_on_request: Vec::new(),
             widening_contexts: Vec::new(),
             widened_types: Default::default(),
             iteration_types_cache: Default::default(),
@@ -1677,6 +1684,11 @@ pub struct Checker<'p, 's> {
     /// The spans of `task.file` that `checkSourceFile` never visits. The passes that iterate over
     /// all nodes of a kind do visit them.
     never_checked: std::cell::RefCell<Vec<(u32, u32)>>,
+    /// The type arguments of the import types of `task.file` that `checkImportType` has visited, each from its first
+    /// argument to the end of the import type. After `checkSourceFile`: without the expressions there that a query has
+    /// evaluated. The passes skip them like `never_checked`. What a query reports there is reported: the check of another
+    /// file may be the one that asks.
+    unchecked_type_arguments: Vec<(u32, u32)>,
     /// The intersections being tested for being uninhabited.
     pub(super) never_in_progress: Vec<TypeId>,
     /// `resolvedReducedType` of a union, once the answer for every member is final.
@@ -1814,6 +1826,8 @@ pub struct Checker<'p, 's> {
     tracked_names: Vec<(FileId, crate::bind::ScopeId, Atom, SymFlags)>,
     /// `Checked::unused_private_members` of the file that is being checked.
     unused_private_members: Vec<(Sym, u32)>,
+    /// `Checked::unused_on_request` of the file that is being checked.
+    unused_on_request: Vec<errors_unused::UnusedOnRequest>,
     /// The contexts of the unions being widened. A `*WideningContext` is an index into it.
     widening_contexts: Vec<symbols::WideningContext<'p>>,
     /// `cachedTypes[CachedTypeKindWidened]`

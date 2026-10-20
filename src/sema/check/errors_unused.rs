@@ -57,12 +57,28 @@ struct Unused<'a, 's> {
     owner_of_scope: Vec<SymbolId>,
     /// The file has a `return` whose expression is never checked: see `is_in_unchecked_return`.
     has_unchecked_returns: bool,
-    /// `Checker::never_checked` after `check_source_file`.
+    /// `Checker::never_checked` and `Checker::unchecked_type_arguments` after `check_source_file`.
     never_checked: Vec<(u32, u32)>,
+    /// The type references in `Checker::unchecked_type_arguments` that a query has resolved: `Resolve` with `isUse` has
+    /// run for them. Sorted.
+    resolved_references: Vec<usize>,
+    /// The ones that no query has resolved, each with where an unused declaration that it names is reported. Sorted.
+    unread_references: Vec<(u32, TypeNodeId)>,
     /// The starts of the parser's and the scanner's errors. Sorted. Empty for a file that parses.
     syntax_errors: Vec<u32>,
     locals: bool,
     parameters: bool,
+}
+
+/// What `check_unused` reports for a declaration, or for a list of them as a whole, where a type reference below the type
+/// arguments of an import type names the declaration and nothing has resolved that reference. A check that resolves it
+/// later makes the declaration used: see `Program::finish_file`.
+pub(super) struct UnusedOnRequest {
+    /// The start and the code of what is reported.
+    pub(super) whole: (u32, u32),
+    /// For each declaration that it is about: the references that name it, and what is reported for it alone once
+    /// another declaration of the list is used. `None`: `whole` is about it alone.
+    pub(super) declarations: Vec<(Vec<TypeNodeId>, Option<Reported>)>,
 }
 
 /// What a name resolves to where it is used.
@@ -108,7 +124,13 @@ impl Checker<'_, '_> {
             referenced: vec![0; bound.symbols.len()],
             owner_of_scope: vec![SymbolId::NONE; bound.scopes.len()],
             has_unchecked_returns: false,
-            never_checked: self.never_checked.borrow().clone(),
+            never_checked: [
+                &self.never_checked.borrow()[..],
+                &self.unchecked_type_arguments[..],
+            ]
+            .concat(),
+            resolved_references: Vec::new(),
+            unread_references: Vec::new(),
             syntax_errors,
             locals,
             parameters,
@@ -136,6 +158,7 @@ impl Checker<'_, '_> {
             |s| matches!(s.kind, StmtKind::Return(e) if e.is_some() && u.is_in_unchecked_return(e)),
         );
         let index = self.exprs_by_kind(file);
+        self.note_references_in_unchecked_type_arguments(&mut u);
         self.note_identifiers(file, &index, &mut u);
         u.note_references();
         self.note_module_references(file, &mut u);
@@ -199,7 +222,78 @@ impl Checker<'_, '_> {
         }
         self.check_unused_renamed_binding_elements(&u, &renamed);
         if locals || parameters {
+            let reported = self.reported.len();
             self.check_unused_identifiers(&u);
+            self.note_unused_on_request(&u, reported);
+        }
+    }
+
+    /// `Resolve` marks a symbol as referenced when a name is resolved. Below the type arguments of an import type that is
+    /// when something asks for the type.
+    fn note_references_in_unchecked_type_arguments(&mut self, u: &mut Unused) {
+        if self.unchecked_type_arguments.is_empty() {
+            return;
+        }
+        let (hir, bound, file) = (u.hir, u.bound, u.file);
+        let is_unchecked = |pos: u32| {
+            let mut type_arguments = self.unchecked_type_arguments.iter();
+            type_arguments.any(|&(from, to)| (from..to).contains(&pos))
+        };
+        let resolved = self.p.references_resolved_on_request.lock();
+        for (i, node) in hir.types.iter().enumerate() {
+            let TypeNodeKind::Ref { name, .. } = node.kind else {
+                continue;
+            };
+            if !is_unchecked(node.pos) {
+                continue;
+            }
+            let key = (file, TypeNodeId(i as u32));
+            if resolved.contains(&key) {
+                u.resolved_references.push(i);
+                continue;
+            }
+            let Some(first) = hir.texts(name).next() else {
+                continue;
+            };
+            let meaning = match name.len() {
+                1 => SymFlags::TYPE,
+                _ => SymFlags::NAMESPACE,
+            };
+            let used = u.resolve_use(bound.type_scope[i], first, meaning);
+            let Some(used) = used.filter(|it| !it.is_self_reference) else {
+                continue;
+            };
+            for &decl in bound.symbol(used.symbol).decls {
+                // Where `report_unused_local` and `check_unused_type_parameters` report.
+                let start = match decl {
+                    Decl::TypeParam(p) => hir[p].start,
+                    _ => hir.start(hir.name(hir.node(decl))),
+                };
+                u.unread_references.push((start, key.1));
+            }
+        }
+        u.unread_references.shared_sort_unstable();
+    }
+
+    /// After `check_unused_identifiers`, which has reported from index `reported` on: what it has reported for one
+    /// declaration that only `Unused::unread_references` name.
+    fn note_unused_on_request(&mut self, u: &Unused, reported: usize) {
+        if u.unread_references.is_empty() {
+            return;
+        }
+        let wholes = self.unused_on_request.iter().map(|it| it.whole);
+        let wholes: Vec<(u32, u32)> = wholes.collect();
+        for d in &self.reported[reported..] {
+            let references = u.unread_references_at(d.start);
+            if matches!(d.code, 6133 | 6196)
+                && !references.is_empty()
+                && !wholes.contains(&(d.start, d.code))
+            {
+                self.unused_on_request.push(UnusedOnRequest {
+                    whole: (d.start, d.code),
+                    declarations: vec![(references, None)],
+                });
+            }
         }
     }
 
@@ -1321,7 +1415,10 @@ impl Unused<'_, '_> {
             let TypeNodeKind::Ref { name, .. } = hir.types[i].kind else {
                 continue;
             };
-            if bound.is_unchecked_type(i) || self.is_never_checked(hir.types[i].pos) {
+            if bound.is_unchecked_type(i)
+                || self.is_never_checked(hir.types[i].pos)
+                    && self.resolved_references.binary_search(&i).is_err()
+            {
                 continue;
             }
             let Some(first) = hir.texts(name).next() else {
@@ -1389,6 +1486,13 @@ impl Unused<'_, '_> {
         for symbol in members.chain(properties).filter(|symbol| symbol.is_some()) {
             self.referenced[symbol.idx()] |= ALL;
         }
+    }
+
+    /// The `unread_references` that name the declaration for which an unused declaration is reported at `start`.
+    fn unread_references_at(&self, start: u32) -> Vec<TypeNodeId> {
+        let from = (self.unread_references).partition_point(|it| it.0 < start);
+        let at = self.unread_references[from..].iter();
+        at.take_while(|it| it.0 == start).map(|it| it.1).collect()
     }
 
     /// `isReferenced`
@@ -2279,6 +2383,13 @@ impl Checker<'_, '_> {
                 + import.named.len();
             if declaration_count > 1 && declaration_count == unuseds.len() {
                 let at = (file, hir[stmt].start, self.end_of_stmt(file, stmt));
+                let declarations = unuseds.iter().map(|&(_, unused)| {
+                    let references = u.unread_references_at(hir.start(hir.name(unused)));
+                    (references, unused)
+                });
+                self.report_unused_list(u, (at.1, 6192), declarations.collect(), |c, &unused| {
+                    c.report_unused_local(u, unused, hir.text(hir.name(unused)));
+                });
                 self.report_unused(u, clause, false, at, 6192, &[]);
             } else {
                 for &(_, unused) in unuseds {
@@ -2385,6 +2496,12 @@ impl Checker<'_, '_> {
             if hir.text.get(close) == Some(&b',') {
                 close = skip_trivia(&hir.text, close + 1);
             }
+            let declarations = params.iter();
+            let declarations = declarations.map(|p| (u.unread_references_at(hir[p].start), p));
+            self.report_unused_list(u, (start, 6205), declarations.collect(), |c, &p| {
+                let at = (file, hir[p].start, c.end_of_type_param(file, p));
+                c.report_unused(u, node, true, at, 6196, &[Arg::Atom(hir[p].name)]);
+            });
             return self.report_unused(u, node, true, (file, start, close as u32 + 1), 6205, &[]);
         }
         for p in params.iter() {
@@ -2393,6 +2510,30 @@ impl Checker<'_, '_> {
                 self.report_unused(u, node, true, at, 6196, &[Arg::Atom(hir[p].name)]);
             }
         }
+    }
+
+    /// Before the declarations of a list are reported as a whole, at `whole`. If `Unused::unread_references` name one of
+    /// them, `alone` reports each by itself, for `UnusedOnRequest::declarations`.
+    fn report_unused_list<D>(
+        &mut self,
+        u: &Unused<'_, '_>,
+        whole: (u32, u32),
+        declarations: Vec<(Vec<TypeNodeId>, D)>,
+        mut alone: impl FnMut(&mut Self, &D),
+    ) {
+        if u.unread_references.is_empty() || declarations.iter().all(|it| it.0.is_empty()) {
+            return;
+        }
+        let declarations = declarations.into_iter().map(|(references, declaration)| {
+            let reported = self.reported.len();
+            alone(self, &declaration);
+            (references, self.reported.drain(reported..).next())
+        });
+        let declarations = declarations.collect();
+        self.unused_on_request.push(UnusedOnRequest {
+            whole,
+            declarations,
+        });
     }
 
     /// `checkUnusedClassMembers`

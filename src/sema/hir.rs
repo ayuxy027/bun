@@ -585,6 +585,8 @@ pub struct LazyCells {
     pub(crate) type_query_places: OnceLock<Places<Box<[TextRange]>>>,
     /// `File::is_in_class_extends`
     pub(crate) class_extends_places: OnceLock<Places<Box<[TextRange]>>>,
+    /// `File::type_arguments_of_import_types`
+    pub(crate) import_type_argument_places: OnceLock<Places<Box<[TextRange]>>>,
     /// `File::keyword_identifiers`
     pub(crate) keyword_identifiers: OnceLock<Box<[Node]>>,
 }
@@ -596,6 +598,7 @@ static CELLS_OF_NO_NODES: LazyCells = LazyCells {
     ambient_or_type_places: OnceLock::new(),
     type_query_places: OnceLock::new(),
     class_extends_places: OnceLock::new(),
+    import_type_argument_places: OnceLock::new(),
     keyword_identifiers: OnceLock::new(),
 };
 

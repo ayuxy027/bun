@@ -118,7 +118,7 @@ pub(super) fn is_with_statement(hir: &File, s: StmtId) -> bool {
 }
 
 /// The parts of `range` that are in none of `holes`.
-fn parts_outside(range: (u32, u32), mut holes: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+pub(super) fn parts_outside(range: (u32, u32), mut holes: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
     holes.shared_sort_unstable();
     let (mut from, mut parts) = (range.0, Vec::new());
     for (start, end) in holes {
@@ -892,6 +892,21 @@ impl Checker<'_, '_> {
     /// after all passes.
     pub(super) fn remove_diagnostics_in_unchecked_ranges(&mut self, file: FileId) {
         let hir = self.hir(file);
+        // `checkImportType` checks nothing below the type arguments: not what the parser has noted for a check to report.
+        if !self.unchecked_type_arguments.is_empty() {
+            let is_unchecked = |parsed: &&Diagnostic| {
+                matches!(
+                    parsed.kind,
+                    DiagnosticKind::Grammar | DiagnosticKind::Checker
+                ) && (self.unchecked_type_arguments.iter())
+                    .any(|&(from, to)| (from..to).contains(&parsed.start))
+            };
+            let noted = hir.diagnostics.iter().filter(is_unchecked);
+            let noted: Vec<(u32, u32)> = noted.map(|parsed| (parsed.start, parsed.code)).collect();
+            if !noted.is_empty() {
+                (self.reported).retain(|d| d.file != file || !noted.contains(&(d.start, d.code)));
+            }
+        }
         let discarded = self.ranges_checked_discarding(file);
         let never_checked = [&self.never_checked.borrow()[..], &discarded[..]].concat();
         if !never_checked.is_empty() {

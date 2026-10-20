@@ -811,7 +811,8 @@ impl Checker<'_, '_> {
             && !diagnostic.by_emit
             && self.is_left_to_an_earlier_file(owner, diagnostic.file)
         {
-            if self.is_resolved_on_request_at(diagnostic.file, diagnostic.start) {
+            let unchecked = self.hir(diagnostic.file).type_arguments_of_import_types();
+            if unchecked.contain(diagnostic.start) {
                 (self.task).leave_to_whoever_asks_before("an error that no check asks for");
             }
             // Not every error comes through `add_diagnostic`.
@@ -886,8 +887,34 @@ impl Checker<'_, '_> {
             }
             _ => true,
         };
-        (owner.iter().chain(in_progress))
-            .any(|&q| is_asked_by_check(q) && q.syntax().is_none_or(is_in_time))
+        (owner.iter().chain(in_progress)).any(|&q| {
+            is_asked_by_check(q)
+                && q.syntax().is_none_or(is_in_time)
+                && !self.is_in_unchecked_type_arguments(q)
+        })
+    }
+
+    /// Whether `q` is about syntax below the type arguments of an import type. `checkImportType` checks nothing there, so
+    /// no check asks for `q`.
+    fn is_in_unchecked_type_arguments(&self, q: Query) -> bool {
+        let (file, pos) = match q {
+            Query::TypeNode(file, node) => (file, self.hir(file)[node].pos),
+            Query::Pat(file, pat) | Query::ParameterSymbol(file, pat) => {
+                (file, self.hir(file)[pat].pos)
+            }
+            Query::Return(file, func) | Query::ReturnAtFirstLook(file, func) => {
+                (file, self.hir(file)[func].start)
+            }
+            Query::Expr(file, e) | Query::ExprInFlowLoop(file, e) | Query::Call(file, e) => {
+                (file, self.hir(file)[e].pos)
+            }
+            Query::Symbol(symbol) => match self.place_of_symbol(symbol) {
+                Some((file, start, _)) => (file, start),
+                None => return false,
+            },
+            _ => return false,
+        };
+        (self.hir(file).type_arguments_of_import_types()).contain(pos)
     }
 
     /// Whether `checkVariableLikeDeclaration` `returns_before_type_of_symbol` for every name that

@@ -10,7 +10,7 @@ use super::errors_operators::{
     check_grammar_rest_element, check_instance_of_expression, check_satisfies,
     check_tagged_template, check_template_spans, check_yield_result,
 };
-use super::errors_statements::is_with_statement;
+use super::errors_statements::{is_with_statement, parts_outside};
 use super::sink::MAX_SERIALIZATION_LEVEL;
 use super::*;
 use crate::bind::{Decl, FnOwner, MemberOwner, Parent, PatParent};
@@ -128,6 +128,7 @@ impl<'s> Checker<'_, 's> {
         let since = self.task.diagnostics.split_off(logged).into_iter();
         (self.task.diagnostics).extend(since.filter(|(owner, _)| owner.is_some()));
         self.never_checked.get_mut().clear();
+        self.unchecked_type_arguments.clear();
     }
 
     /// Settles `unvisited_exprs`. A query that computes a type from one checks the whole of it
@@ -135,7 +136,12 @@ impl<'s> Checker<'_, 's> {
     /// `checkAndAggregateYieldOperandTypes`). What no query has reached by the end of
     /// `checkSourceFile` is never checked.
     fn check_exprs_visited_by_queries(&mut self, file: FileId) {
+        let is_in_type_arguments = |c: &Self, pos: u32| {
+            let mut type_arguments = c.unchecked_type_arguments.iter();
+            type_arguments.any(|&(from, to)| (from..to).contains(&pos))
+        };
         let mut unvisited = Vec::new();
+        let mut checked_in_type_arguments = Vec::new();
         loop {
             // `onFailedToResolveSymbol` is part of the walk: `getSpellingSuggestionForName` resolves
             // the aliases among its candidates, and `getTargetOfAliasLikeExpression` checks.
@@ -149,25 +155,37 @@ impl<'s> Checker<'_, 's> {
             if visited.is_empty() {
                 break;
             }
-            for (_, e) in visited {
+            for (start, e) in visited {
                 self.check_expression(file, e);
+                if is_in_type_arguments(self, start) {
+                    checked_in_type_arguments.push((start, self.end_of_expr(file, e)));
+                }
             }
             self.check_deferred_nodes(file);
         }
         for (start, e) in unvisited {
+            // Left to the queries with everything around it.
+            if is_in_type_arguments(self, start) {
+                continue;
+            }
             let range = (start, self.end_of_expr(file, e));
             self.never_check_unless_visited_by_query(file, self.hir(file).node(e), range);
+        }
+        for (from, to) in std::mem::take(&mut self.unchecked_type_arguments) {
+            let is_inside = |checked: &&(u32, u32)| (from..to).contains(&checked.0);
+            let checked = checked_in_type_arguments.iter().filter(is_inside);
+            let left = parts_outside((from, to), checked.copied().collect());
+            self.unchecked_type_arguments.extend(left);
         }
         self.never_check_with_bodies(file);
         self.never_check_specifier_expressions(file);
         self.never_check_options_of_import_types(file);
     }
 
-    /// Whether `pos` is in a range given to `never_check`.
+    /// Whether `pos` is in a range given to `never_check`, or in `unchecked_type_arguments`.
     pub(super) fn is_never_checked(&self, pos: u32) -> bool {
         let never_checked = self.never_checked.borrow();
-        never_checked
-            .iter()
+        (never_checked.iter().chain(&self.unchecked_type_arguments))
             .any(|&(from, to)| (from..to).contains(&pos))
     }
 
@@ -1230,6 +1248,19 @@ impl<'s> Checker<'_, 's> {
         }
     }
 
+    /// `leave_unvisited` for the outermost expressions below `node`, which no check visits: the operand of a `typeof`, a
+    /// computed name, the default of a parameter.
+    fn leave_expressions_unvisited_below(&mut self, file: FileId, node: Node) {
+        let hir = self.hir(file);
+        hir.for_each_child(node, &mut |child| {
+            match hir.data(child) {
+                NodeData::Expr(e) => self.leave_unvisited(file, e),
+                _ => self.leave_expressions_unvisited_below(file, child),
+            }
+            false
+        });
+    }
+
     /// `checkSourceElement` for a type node.
     pub(super) fn check_type_node(&mut self, file: FileId, node: TypeNodeId) {
         if node.is_none() || self.is_stack_low() {
@@ -1255,6 +1286,11 @@ impl<'s> Checker<'_, 's> {
             TypeNodeKind::Import { spec, args, .. } => {
                 if spec.is_none() {
                     self.check_type_nodes(file, args);
+                } else if let Some(first) = hir.ids(args).next() {
+                    (self.unchecked_type_arguments).push((hir[first].pos, hir[node].end));
+                    for argument in hir.ids(args) {
+                        self.leave_expressions_unvisited_below(file, hir.node(argument));
+                    }
                 }
                 self.check_attributes_of_import_type(file, node);
                 self.check_type_reference_or_import(file, node)

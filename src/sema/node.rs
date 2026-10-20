@@ -2711,6 +2711,10 @@ impl<R: std::ops::Deref<Target = [TextRange]>> Places<R> {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = &TextRange> {
+        self.0.iter()
+    }
 }
 
 // ───────────────────────────── ast/utilities.go ─────────────────────────────
@@ -3394,6 +3398,33 @@ impl File<'_> {
             .at_its_size()
         });
         places.contain(self[e].pos)
+    }
+
+    /// The type arguments of the import types, each from its first argument to the end of the import type.
+    /// `checkImportType` checks nothing below them, and `getTypeFromTypeNode` resolves them as far as something asks.
+    pub fn type_arguments_of_import_types(&self) -> &Places<Box<[TextRange]>> {
+        self.lazy.cells.import_type_argument_places.get_or_init(|| {
+            // FOR SPEED: most files have few specifiers and no import type.
+            let mut specifiers = self.specifier_uses.iter();
+            let has_import_types = specifiers.any(|it| it.kind == SpecifierKind::ImportType);
+            let nodes = self.types.iter().take(match has_import_types {
+                true => usize::MAX,
+                false => 0,
+            });
+            let nodes = nodes.filter_map(|node| match node.kind {
+                // An argument that is no string is in `args`, and the type arguments are in no node.
+                TypeNodeKind::Import { spec, args, .. } if spec.is_some() => {
+                    let first = self.ids(args).next()?;
+                    Some(TextRange {
+                        pos: self[first].pos,
+                        // One whose end is unknown extends to the end.
+                        end: if node.end == 0 { u32::MAX } else { node.end },
+                    })
+                }
+                _ => None,
+            });
+            Places::new(nodes).at_its_size()
+        })
     }
 
     /// `isInAmbientOrTypeNode`, in one walk up the parents. A node that starts outside every such

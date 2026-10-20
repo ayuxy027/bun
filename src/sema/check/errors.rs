@@ -6,6 +6,7 @@
 
 use super::enclosing_declaration::Enclosing;
 use super::errors_aliases::Directives;
+use super::errors_unused::UnusedOnRequest;
 use super::errors_names_and_exports::fully_qualified_name;
 use super::errors_operators::has_empty_object_intersection;
 use super::explain::{Explained, NOWHERE};
@@ -34,6 +35,8 @@ pub struct Checked {
     /// The private members that `checkUnusedClassMembers` has reported, and where. See
     /// `Program::properties_referenced_before`.
     unused_private_members: Vec<(Sym, u32)>,
+    /// See `UnusedOnRequest`.
+    unused_on_request: Vec<UnusedOnRequest>,
     /// `Options::writes_declaration_files`: the emitted text of the file's declaration file, if it
     /// has one.
     pub declaration_file: Option<Vec<u8>>,
@@ -51,6 +54,7 @@ impl Checked {
             expected_errors: Vec::new(),
             never_checked: Vec::new(),
             unused_private_members: Vec::new(),
+            unused_on_request: Vec::new(),
             declaration_file: None,
         })
     }
@@ -91,6 +95,23 @@ impl Program<'_> {
                 };
                 out.retain(|d| !is_referenced(d));
             }
+            // A reference below the type arguments of an import type is resolved when something asks for its type, and
+            // the task that has reported the declaration as unused does not see what another task has resolved since.
+            // Whichever task has, the declaration is used. It does not depend on which task comes first.
+            let resolved = self.references_resolved_on_request.lock();
+            for unused in checked.unused_on_request {
+                let is_resolved = |node: &TypeNodeId| resolved.contains(&(file, *node));
+                let is_used = |it: &(Vec<TypeNodeId>, Option<Reported>)| it.0.iter().any(is_resolved);
+                if unused.declarations.iter().any(is_used) {
+                    let reported = out.len();
+                    out.retain(|d| (d.start, d.code) != unused.whole || !d.by_another_node);
+                    if out.len() < reported {
+                        let alone = unused.declarations.into_iter().filter(|it| !is_used(it));
+                        out.extend(alone.filter_map(|it| it.1));
+                    }
+                }
+            }
+            drop(resolved);
             // `getDiagnosticsWithPrecedingDirectives`
             let used = out.iter().map(|d| d.directive);
             let mut used: Vec<u32> = used.filter(|&start| start != NO_DIRECTIVE).collect();
@@ -249,6 +270,7 @@ impl Checker<'_, '_> {
         self.deferred_diagnostics.clear();
         self.node_check_flags.clear();
         self.never_checked.borrow_mut().clear();
+        self.unchecked_type_arguments.clear();
         self.unknown_symbols.clear();
         self.alias_targets_reported.clear();
         self.signatures_resolved_discarding.clear();
@@ -369,6 +391,7 @@ impl Checker<'_, '_> {
         let declaration = self.get_declaration_diagnostics(file);
         self.is_type_checked = true;
         let mut directives = Directives::default();
+        let unused_on_request = self.settled_unused_on_request(&semantic, &mut directives);
         let semantic = semantic.into_iter();
         let mut semantic: Vec<Reported> =
             (semantic.filter_map(|d| self.settled(d, &mut directives))).collect();
@@ -377,6 +400,7 @@ impl Checker<'_, '_> {
         // while processing the directives are dropped.
         self.reported.clear();
         let mut checked = self.checked(syntactic, declaration);
+        checked.unused_on_request = unused_on_request;
         checked.expected_errors = expected_errors;
         if hir.check_directive != Some(false) {
             // `JSDocDiagnostics`: after the filters of `settled`, and a directive suppresses them.
@@ -399,6 +423,31 @@ impl Checker<'_, '_> {
         }
         checked.semantic = Some(semantic);
         checked
+    }
+
+    /// `Checker::unused_on_request` as `finish_file` finds the diagnostics of the file: `settled`. `semantic`: those
+    /// diagnostics before that.
+    fn settled_unused_on_request(
+        &mut self,
+        semantic: &[Reported],
+        directives: &mut Directives,
+    ) -> Vec<UnusedOnRequest> {
+        let mut all = std::mem::take(&mut self.unused_on_request);
+        all.retain_mut(|unused| {
+            let is_whole = |d: &&Reported| (d.start, d.code) == unused.whole && d.by_another_node;
+            let Some(whole) = semantic.iter().find(is_whole) else {
+                return false;
+            };
+            let Some(whole) = self.settled(whole.clone(), directives) else {
+                return false;
+            };
+            unused.whole.0 = whole.start;
+            for declaration in &mut unused.declarations {
+                declaration.1 = (declaration.1.take()).and_then(|d| self.settled(d, directives));
+            }
+            true
+        });
+        all
     }
 
     /// `GetDeclarationDiagnostics`. It also runs for files that are not type-checked. `self.reported` must be empty on entry.
@@ -424,6 +473,7 @@ impl Checker<'_, '_> {
             expected_errors: Vec::new(),
             never_checked: self.never_checked.take(),
             unused_private_members: std::mem::take(&mut self.unused_private_members),
+            unused_on_request: std::mem::take(&mut self.unused_on_request),
             declaration_file: self.declaration_file.take(),
         }
     }
@@ -1323,6 +1373,14 @@ impl Checker<'_, '_> {
             }
         } else {
             self.note_error_in(file);
+            // As in `log_diagnostic`: only `check_file` of `file` reports it, and no check visits `e` there.
+            let hir = self.hir(file);
+            let is_late = |visited: FileId| !self.is_checked_no_later_than(visited, file);
+            if self.task.file.is_some_and(is_late)
+                && hir.type_arguments_of_import_types().contain(hir[e].pos)
+            {
+                (self.task).leave_to_whoever_asks_before("an error that no check asks for");
+            }
         }
         self.unresolved_identifiers.push((file, e, name));
     }
@@ -1332,10 +1390,18 @@ impl Checker<'_, '_> {
     ///
     /// Only for the file being checked. No other task stores the entry of an unresolved identifier (`is_noted_for_check_file`), so
     /// `check_file` of another file evaluates its own identifiers itself, before its last call of this function.
+    /// Not below the type arguments of an import type, which no check visits: whoever evaluates one there reports, unless
+    /// tsc collects the errors of that file before.
     pub(super) fn report_unresolved_identifiers(&mut self) {
         while !self.unresolved_identifiers.is_empty() {
             let mut unresolved = std::mem::take(&mut self.unresolved_identifiers);
-            unresolved.retain(|u| Some(u.0) == self.task.file);
+            unresolved.retain(|&(file, e, _)| {
+                Some(file) == self.task.file || {
+                    let hir = self.hir(file);
+                    (self.task.file).is_some_and(|it| self.is_checked_no_later_than(it, file))
+                        && hir.type_arguments_of_import_types().contain(hir[e].pos)
+                }
+            });
             unresolved.shared_sort_unstable_by_key(|u| (u.0, u.1));
             unresolved.dedup_by_key(|u| (u.0, u.1));
             for (file, e, name) in unresolved {

@@ -1101,30 +1101,10 @@ impl<'p, 's> Checker<'p, 's> {
         }))
     }
 
-    /// The type arguments of the import types of `file`, each from its first argument to the end of the import type.
-    /// `checkImportType` checks nothing below them, and `getTypeFromTypeNode` resolves them as far as something asks.
-    pub(super) fn type_arguments_of_import_types(&self, file: FileId) -> Places {
-        let hir = self.hir(file);
-        let mut specifiers = hir.specifier_uses.iter();
-        if !specifiers.any(|it| it.kind == SpecifierKind::ImportType) {
-            return Places::new(std::iter::empty());
-        }
-        Places::new(hir.types.iter().filter_map(|node| match node.kind {
-            TypeNodeKind::Import { spec, args, .. } if spec.is_some() => {
-                let first = hir.ids(args).next()?;
-                Some(TextRange {
-                    pos: hir[first].pos,
-                    end: node.end,
-                })
-            }
-            _ => None,
-        }))
-    }
-
-    /// Whether the check of `file` leaves what is at `pos` to whoever asks for it: see `type_arguments_of_import_types` and
-    /// `unchecked_jsdoc_types`.
+    /// Whether the check of `file` leaves what is at `pos` to whoever asks for it: see `File::type_arguments_of_import_types`
+    /// and `unchecked_jsdoc_types`.
     pub(super) fn is_resolved_on_request_at(&self, file: FileId, pos: u32) -> bool {
-        self.type_arguments_of_import_types(file).contain(pos)
+        self.hir(file).type_arguments_of_import_types().contain(pos)
             || self.unchecked_jsdoc_types(file).contain(pos)
     }
 
@@ -3368,6 +3348,10 @@ impl<'p, 's> Checker<'p, 's> {
                     return intended;
                 }
                 let names: SmallVec<[Atom; 4]> = hir.texts(name).collect();
+                let options = &self.p.files.options;
+                if options.no_unused_locals || options.no_unused_parameters {
+                    self.note_reference_resolved_on_request(file, node);
+                }
                 // `resolveTypeReferenceName`: `getUnresolvedSymbolForEntityName`
                 // `NameResolver.Resolve`: for `const` the walk ends without an error at an `as const`.
                 let is_const_assertion = |n| matches!(hir.data(n), NodeData::Expr(e) if matches!(hir[e].kind, ExprKind::AsConst(_)));
@@ -3384,6 +3368,15 @@ impl<'p, 's> Checker<'p, 's> {
         }
     }
 
+    /// `Resolve` with `isUse` is about to run for the type reference `node`. `check_unused` of `file` counts the references
+    /// of the file. Below the type arguments of an import type, that is a reference only now.
+    fn note_reference_resolved_on_request(&self, file: FileId, node: TypeNodeId) {
+        let hir = self.hir(file);
+        if (hir.type_arguments_of_import_types()).contain(hir[node].pos) {
+            (self.p.references_resolved_on_request.lock()).insert((file, node));
+        }
+    }
+
     /// `getTypeFromImportTypeNode`
     fn get_type_from_import_type_node(
         &mut self,
@@ -3392,12 +3385,18 @@ impl<'p, 's> Checker<'p, 's> {
         node: TypeNodeId,
     ) -> TypeId {
         let TypeNodeKind::Import {
-            args, is_typeof, ..
+            spec,
+            args,
+            is_typeof,
+            ..
         } = self.hir(file)[node].kind
         else {
             return TypeId::ERROR;
         };
         let reports_errors = !self.bound(file).is_unchecked_type(node.idx());
+        if spec.is_none() && reports_errors {
+            self.report_argument_of_import_type_on_request(file, node);
+        }
         let Some(symbol) = self.resolve_import_type(file, node, reports_errors) else {
             return TypeId::ERROR;
         };
@@ -3439,6 +3438,23 @@ impl<'p, 's> Checker<'p, 's> {
             return TypeId::ERROR;
         }
         self.type_reference_type_of_node(file, scope, node, sym, args)
+    }
+
+    /// `getTypeFromImportTypeNode`: 1141 for the argument of the import type `node`, which is no string literal. The parser
+    /// has noted it for the check of `node`. Below the type arguments of an import type nothing is checked, and this
+    /// resolution reports it.
+    #[cold]
+    #[inline(never)]
+    fn report_argument_of_import_type_on_request(&mut self, file: FileId, node: TypeNodeId) {
+        let hir = self.hir(file);
+        let (start, end) = (hir[node].pos, hir[node].end);
+        if !hir.type_arguments_of_import_types().contain(start) {
+            return;
+        }
+        let mut noted = hir.diagnostics.iter();
+        if let Some(noted) = noted.find(|it| it.code == 1141 && (start..end).contains(&it.start)) {
+            self.add_diagnostic(Reported::from_hir(file, noted));
+        }
     }
 
     /// `resolveExternalModuleName(node, n.Argument.AsLiteralTypeNode().Literal, false /*ignoreErrors*/)` of
