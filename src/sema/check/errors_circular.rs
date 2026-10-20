@@ -9,7 +9,7 @@
 use super::explain::NOWHERE;
 use super::sink::held;
 use super::*;
-use crate::bind::{Decl, FnOwner, MemberOwner, Parent, PatParent, Symbol, SymbolId};
+use crate::bind::{Decl, FnOwner, Parent, Symbol, SymbolId};
 
 impl Checker<'_, '_> {
     pub(super) fn check_circularities(&mut self, file: FileId) {
@@ -90,73 +90,9 @@ impl Checker<'_, '_> {
         self.add_diagnostic_of(Some(Query::TypeNode(file, constraint)), err);
     }
 
-    /// Requests the types for which `reportCircularityError`, `getReturnTypeOfSignature` and
-    /// `getTypeOfAccessors` report cycles.
+    /// Requests the types for which `reportCircularityError` reports cycles, where no function of
+    /// `check_source_file` does.
     fn check_circular_resolutions(&mut self, file: FileId) {
-        let (hir, bound) = (self.hir(file), self.bound(file));
-        let unchecked = self.unchecked_jsdoc_types(file);
-        for i in 0..hir.pats.len() {
-            let pat = PatId(i as u32);
-            if !matches!(hir[pat].kind, PatKind::Ident(_))
-                || matches!(bound.pat_parent[i], PatParent::None)
-                || unchecked.contain(hir[pat].pos)
-                || self.is_never_checked(hir[pat].pos)
-                || self.returns_before_type_of_symbol(file, pat)
-            {
-                continue;
-            }
-            self.type_of_pat(file, pat);
-            // `parameterInitializerContainsUndefined` is evaluated where the parameter is read: in
-            // its own default, that is circular.
-            if let PatParent::Param(p) = bound.pat_parent[i]
-                && hir[p].ty.is_some()
-                && hir[p].default.is_some()
-            {
-                self.type_of_expr(file, hir[p].default);
-            }
-        }
-        for i in 0..hir.members.len() {
-            let member = MemberId(i as u32);
-            if !matches!(
-                hir[member].kind,
-                MemberKind::Property | MemberKind::Getter | MemberKind::Setter
-            ) || matches!(bound.member_owner[i], MemberOwner::None)
-                || unchecked.contain(hir[member].start)
-                || self.is_never_checked(hir[member].start)
-            {
-                continue;
-            }
-            // `getTypeOfSymbol`: the properties and accessors among the declarations of one symbol
-            // are one property, identified by the first.
-            let is_first = bound.member_symbol[i].is_some() && {
-                let sym = self.symbol_of_member(file, member);
-                self.value_declaration_of_property(sym) == Some((file, Decl::Member(member)))
-            };
-            if is_first || hir[member].kind == MemberKind::Property {
-                self.type_of_member_declaration(file, member);
-            }
-        }
-        for i in 0..hir.fns.len() {
-            let func = FnId(i as u32);
-            if matches!(bound.fns[i].owner, FnOwner::None)
-                || unchecked.contain(hir[func].start)
-                || self.is_never_checked(hir[func].start)
-            {
-                continue;
-            }
-            // An annotated accessor of a class, an interface or a type literal was already
-            // requested above, with the property it declares.
-            let is_member = matches!(hir[func].kind, FnKind::Getter | FnKind::Setter)
-                && !(hir[func].kind == FnKind::Getter
-                    && matches!(bound.fns[i].owner, FnOwner::Expr(_)));
-            if hir[func].ret.is_some() && !is_member
-                || hir[func].ret.is_none()
-                    && !matches!(hir[func].body, FnBody::None)
-                    && self.is_inferred_return_type_requested(file, func)
-            {
-                self.return_type_of_fn(file, func);
-            }
-        }
         self.check_circular_exports(file);
         self.check_circular_assignment_declarations(file);
     }

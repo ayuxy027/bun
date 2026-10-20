@@ -13,7 +13,7 @@ use super::errors_operators::{
 use super::errors_statements::is_with_statement;
 use super::sink::MAX_SERIALIZATION_LEVEL;
 use super::*;
-use crate::bind::{Decl, FnOwner, Parent, PatParent};
+use crate::bind::{Decl, FnOwner, MemberOwner, Parent, PatParent};
 use crate::util::SharedSort;
 use smallvec::SmallVec;
 
@@ -625,10 +625,17 @@ impl<'s> Checker<'_, 's> {
         if func.is_none() {
             return;
         }
-        let hir = self.hir(file);
         self.check_signature_declaration(file, func);
         self.check_function_or_constructor_symbols_of(file, Decl::Fn(func));
         self.check_function_body(file, func);
+        self.check_end_of_function_or_method_declaration(file, func);
+    }
+
+    /// `checkFunctionOrMethodDeclaration`, after `checkSourceElement(body)`.
+    fn check_end_of_function_or_method_declaration(&mut self, file: FileId, func: FnId) {
+        let hir = self.hir(file);
+        // `getReturnTypeFromAnnotation`: `checkSourceElement` has not asked for the type of every kind of node.
+        self.type_from_node(file, hir[func].ret);
         self.check_all_code_paths_in_non_void_function_return_or_throw(file, func);
         if hir[func].ret.is_none()
             && hir[func].flags.contains(Flags::GENERATOR)
@@ -1043,7 +1050,14 @@ impl<'s> Checker<'_, 's> {
             }
             if member.func.is_some() {
                 self.check_function_body(file, member.func);
-                self.check_all_code_paths_in_non_void_function_return_or_throw(file, member.func);
+                if member.kind == MemberKind::Method {
+                    self.check_end_of_function_or_method_declaration(file, member.func);
+                } else {
+                    self.check_all_code_paths_in_non_void_function_return_or_throw(
+                        file,
+                        member.func,
+                    );
+                }
             }
             if member.kind == MemberKind::Constructor {
                 self.check_function_or_constructor_symbols_of(file, Decl::Member(m));
@@ -1060,6 +1074,17 @@ impl<'s> Checker<'_, 's> {
                 self.type_of_symbol(symbol);
             }
             self.check_expression(file, member.init);
+            // `checkVariableLikeDeclaration` checks a computed name and the initializer first.
+            if member.kind == MemberKind::Property
+                && !matches!(self.bound(file).member_owner[m.idx()], MemberOwner::None)
+            {
+                if self.bound(file).member_symbol[m.idx()].is_none() {
+                    self.type_of_member_declaration(file, m);
+                } else if matches!(member.key, PropKey::Computed(_)) {
+                    let symbol = self.symbol_of_member(file, m);
+                    self.type_of_symbol(symbol);
+                }
+            }
             self.check_property_initializer(file, m);
             if member.kind == MemberKind::Property {
                 self.check_variable_like_declaration(file, Decl::Member(m));
