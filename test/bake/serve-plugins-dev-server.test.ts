@@ -53,8 +53,10 @@ test.concurrent("DevServer is notified when [serve.static] plugin setup rejects"
       } catch (e) {
         result = (e as Error).name;
       }
+      // The route must not be stuck in the queue for a bundle that never starts.
+      const second = await fetch(server.url).then(res => res.text());
       await server.stop(true);
-      console.log(JSON.stringify({ result }));
+      console.log(JSON.stringify({ result, second }));
     `,
   });
 
@@ -73,11 +75,55 @@ test.concurrent("DevServer is notified when [serve.static] plugin setup rejects"
 
   const line = stdout.split("\n").find(l => l.startsWith("{"));
   expect(line).toBeDefined();
-  const { result } = JSON.parse(line!);
+  const { result, second } = JSON.parse(line!);
   // With the DevServer notified, the deferred request is released promptly. If it
   // isn't, the fetch sits until the 10s abort fires and we see "TimeoutError" here.
   expect(result).not.toBe("TimeoutError");
+  expect(second).toBe("Plugin Error");
   expect(exitCode).toBe(0);
+});
+
+// `bun ./index.html` and `bun bake` load the plugins when the first request arrives, so that
+// request waits for them. The later ones must not wait for a bundle that never starts.
+test.each([
+  { name: "bun ./index.html", args: ["index.html", "--port=0"], page: "index.html" },
+  { name: "bun bake", args: ["bake", "--port=0"], page: "app/pages/index.html" },
+])("$name answers every request when a [serve.static] plugin throws as it loads", async ({ args, page }) => {
+  using dir = tempDir("serve-plugins-devserver-cli", {
+    "bunfig.toml": `[serve.static]\nplugins = ["./plugin.ts"]\n`,
+    "plugin.ts": `throw new Error("plugin failed on purpose");`,
+    [page]: `<!DOCTYPE html><html><body></body></html>`,
+  });
+
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), ...args],
+    env: { ...bunEnv, BUN_FEATURE_FLAG_EXPERIMENTAL_BAKE: "1" },
+    cwd: String(dir),
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const decoder = new TextDecoder();
+  let stdout = "";
+  let url: string | undefined;
+  for await (const chunk of proc.stdout) {
+    stdout += decoder.decode(chunk, { stream: true });
+    url = stdout.match(/url: (http:\/\/\S+)\s/)?.[1];
+    if (url) break;
+  }
+  expect(url, stdout).toBeDefined();
+
+  const waiting = await fetch(url!);
+  expect({ status: waiting.status, body: await waiting.text() }).toEqual({ status: 500, body: "" });
+  for (let i = 0; i < 2; i++) {
+    expect(await fetch(url!).then(res => res.text())).toBe("Plugin Error");
+  }
+  expect(proc.exitCode).toBeNull();
+
+  proc.kill("SIGKILL");
+  const stderr = await proc.stderr.text();
+  expect(stderr.match(/^error: plugin failed on purpose$/gm), stderr).toHaveLength(1);
 });
 
 // DevServer waits on `[serve.static]` plugins and the plugin promise resolves.

@@ -275,6 +275,11 @@ impl DevServer {
                 d.deref_();
             }
         }
+        // Reset these routes so their next request gets the plugin error.
+        for &route_bundle_index in self.next_bundle.route_queue.keys() {
+            self.route_bundles[route_bundle_index.get() as usize].server_state =
+                route_bundle::State::Unqueued;
+        }
         self.next_bundle.route_queue.clear_retaining_capacity();
         // TODO: allow recovery from this state
         Ok(())
