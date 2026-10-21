@@ -1694,6 +1694,7 @@ function getNodeHTTPServerSocket() {
     [kHandoffResponse] = undefined;
     [kDestroySoon] = false;
     [kHandedOff] = false;
+    [kHandshaking] = false;
     server: Server;
     _httpMessage;
     _secureEstablished = false;
