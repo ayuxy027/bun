@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
-// JSC keeps a 1024 slot cache of int32 -> string results. A value enters a
-// slot on its second sighting there; a value seen once gets a fresh string
-// and leaves the resident entry alone (oven-sh/WebKit#821). Every path below
-// must give the exact digits whatever the cache holds.
+// JSC keeps a 1024 slot cache of int32 -> string results. Each slot holds a
+// JSString for the JS-visible paths and a String for Array.prototype.join,
+// under separate keys (oven-sh/WebKit#821). Every path below must give the
+// exact digits whatever the cache holds.
 
 function slowDigits(n: number): string {
   const negative = n < 0;
@@ -18,6 +18,7 @@ function slowDigits(n: number): string {
 
 const paths: Record<string, (n: number) => string> = {
   concat: n => "" + n,
+  join: n => [n].join(""),
   prefixed: n => ("id/" + n).slice(3),
   template: n => `${n}`,
   String: n => String(n),
