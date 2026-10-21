@@ -139,15 +139,14 @@ describe("URI functions", () => {
       Bun.gc(true);
       return heapStats().objectTypeCounts.string ?? 0;
     };
+    const before = stringCells();
     for (const [name, input] of Object.entries(inputs)) {
       const fn = functions[name as keyof typeof functions];
-      keep.length = 0;
-      const before = stringCells();
-      for (let i = 0; i < 20000; i++) keep.push(fn(input));
-      const after = stringCells();
-      // Without the identity return each call makes one string cell: 20000 here.
-      expect(after - before, name).toBeLessThan(1000);
-      expect(keep[0]).toBe(input);
+      for (let i = 0; i < 5000; i++) keep.push(fn(input));
+      expect(keep.at(-1)).toBe(input);
     }
+    const after = stringCells();
+    // Without the identity return each call makes one string cell: 30000 here.
+    expect(after - before).toBeLessThan(500);
   });
 });
