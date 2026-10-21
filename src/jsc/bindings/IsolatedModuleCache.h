@@ -40,10 +40,9 @@ public:
         case SyntheticModuleType::JavaScript:
         case SyntheticModuleType::PackageJSONTypeModule:
         case SyntheticModuleType::PackageJSONTypeCommonJS:
-        // ESM tag is module text Bun generated: a builtin's (e.g. bun:main),
-        // which is constant across globals, and the module of a text, Markdown
-        // or sqlite file. The latter is keyed by path like JS, with the same
-        // gap: another loader for the path (require.extensions) gets it too.
+        // ESM tag is used by builtins that ship real JS source (e.g. bun:wrap).
+        // Their providers are constant across globals, so caching is safe.
+        // A text, Markdown or sqlite module has this tag too, and is keyed by path like JS.
         case SyntheticModuleType::ESM:
             return true;
         default:

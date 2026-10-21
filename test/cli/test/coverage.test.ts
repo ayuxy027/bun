@@ -1179,12 +1179,14 @@ exports.unused = function unused() {
       stderr: "pipe",
     });
     // With --hot the process can stay up after the report: the last line of the report ends the read.
+    const lastLine = /^Ran \d+ tests? across \d+ files?\./m;
     let stderr = "";
     const decoder = new TextDecoder();
     for await (const chunk of proc.stderr) {
       stderr += decoder.decode(chunk, { stream: true });
-      if (/^Ran \d+ tests? across \d+ files?\./m.test(stderr)) break;
+      if (lastLine.test(stderr)) break;
     }
+    expect(stderr).toMatch(lastLine);
     // A debug build also reports the internal modules that it loads, such as bun:sqlite.
     const isFixtureFile = (name: string) => Object.hasOwn(fixture, name);
     const rows: Record<string, { functions: string; lines: string; uncovered: string }> = {};

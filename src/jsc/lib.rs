@@ -837,8 +837,7 @@ pub mod resolved_source_tag {
         pub const Javascript: Self = Self(0);
         pub const PackageJsonTypeModule: Self = Self(1);
         pub const PackageJsonTypeCommonjs: Self = Self(2);
-        /// Module text that Bun generated, not JavaScript of the file at the module's path: `bun:main`, the
-        /// sqlite shim, the WASI runner, the `export default "<string>"` of a text or Markdown import.
+        /// Module text that Bun generated: `bun:main`, the sqlite shim, the WASI runner, a text or Markdown import.
         pub const Esm: Self = Self(6);
         pub const JsonForObjectLoader: Self = Self(7);
         /// Generate an object with `default` set to all the exports, including a `default` property.
@@ -848,10 +847,7 @@ pub mod resolved_source_tag {
         /// Signal upwards that the matching value in `require.extensions` should be used.
         pub const CommonJsCustomExtension: Self = Self(10);
 
-        /// The text that the transpiler returns under one of these tags is what a JavaScript or TypeScript
-        /// loader compiled for the module's path, and `bun test --coverage` reports a module only under
-        /// them (`isJavaScriptTag` in `headers-handwritten.h`). A builtin does not follow this: `bun:wrap`
-        /// has the default tag.
+        /// Source text under these tags is what a JS/TS loader compiled for the module's path (C++: `isJavaScriptTag`).
         #[inline]
         pub const fn is_javascript(self) -> bool {
             self.0 <= Self::PackageJsonTypeCommonjs.0
