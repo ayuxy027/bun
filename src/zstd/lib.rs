@@ -433,9 +433,6 @@ struct ZstdReaderArrayList<'a> {
     pub(crate) zstd: *mut c::ZSTD_DStream,
     pub(crate) state: State,
     pub(crate) total_in: usize,
-    /// Decompression-bomb guard: `read_all` errors instead of growing the
-    /// output past this many bytes. Defaults to unbounded.
-    pub(crate) max_output_size: usize,
 }
 
 impl<'a> ZstdReaderArrayList<'a> {
@@ -466,7 +463,6 @@ impl<'a> ZstdReaderArrayList<'a> {
             zstd,
             state: State::Uninitialized,
             total_in: 0,
-            max_output_size: usize::MAX,
         }))
     }
 
@@ -501,14 +497,6 @@ impl<'a> ZstdReaderArrayList<'a> {
                 return Ok(());
             }
 
-            // Decompression-bomb guard: clamp the output space handed to a single
-            // ZSTD_decompressStream call so one call can never write past the cap.
-            let remaining_output = self.max_output_size.saturating_sub(self.list_ptr.len());
-            if remaining_output == 0 {
-                self.state = State::Error;
-                return Err(ZstdError::ZstdDecompressionError);
-            }
-
             if self.list_ptr.try_reserve(STREAMING_OUTPUT_STEP).is_err() {
                 self.state = State::Error;
                 return Err(ZstdError::OutOfMemory);
@@ -521,7 +509,7 @@ impl<'a> ZstdReaderArrayList<'a> {
             };
             let mut out_buf = c::ZSTD_outBuffer {
                 dst: spare.as_mut_ptr().cast::<c_void>(),
-                size: spare.len().min(remaining_output),
+                size: spare.len(),
                 pos: 0,
             };
 
@@ -611,9 +599,6 @@ impl Drop for ZstdReaderArrayList<'_> {
 pub struct StreamingDecoder {
     stream: core::ptr::NonNull<c::ZSTD_DStream>,
     pub(crate) state: State,
-    /// Decompression-bomb guard: `decompress` errors instead of growing the
-    /// output past this many bytes. Defaults to unbounded.
-    pub(crate) max_output_size: usize,
     /// zstd filled its last window and may hold more. `max_output` can end a call there.
     output_full: bool,
 }
@@ -627,7 +612,6 @@ impl StreamingDecoder {
         Ok(Self {
             stream,
             state: State::Uninitialized,
-            max_output_size: usize::MAX,
             output_full: false,
         })
     }
@@ -671,12 +655,6 @@ impl StreamingDecoder {
                 return Ok(total_in);
             }
 
-            let remaining_output = self.max_output_size.saturating_sub(out.len());
-            if remaining_output == 0 {
-                self.state = State::Error;
-                return Err(ZstdError::ZstdDecompressionError);
-            }
-
             if out.try_reserve(STREAMING_OUTPUT_STEP).is_err() {
                 self.state = State::Error;
                 return Err(ZstdError::OutOfMemory);
@@ -690,7 +668,7 @@ impl StreamingDecoder {
             };
             let mut out_buf = c::ZSTD_outBuffer {
                 dst: spare.as_mut_ptr().cast::<c_void>(),
-                size: spare.len().min(remaining_output).min(budget),
+                size: spare.len().min(budget),
                 pos: 0,
             };
 

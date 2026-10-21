@@ -253,21 +253,8 @@ fn parse_options(global_this: &JSGlobalObject, opts_value: JSValue) -> JsResult<
 
         // Handle remaining boolean options (autolinks/headings are only settable via
         // compound options above). `md::Options::BOOL_FIELD_SETTERS` is a hand-maintained
-        // table in bun_md that carries each bool field's snake_case and camelCase names
-        // plus a setter.
+        // table in bun_md that carries their snake_case and camelCase names plus a setter.
         for (snake, camel, set) in md::Options::BOOL_FIELD_SETTERS {
-            // skip the compound-only fields
-            if matches!(
-                *snake,
-                "permissive_autolinks"
-                    | "permissive_url_autolinks"
-                    | "permissive_www_autolinks"
-                    | "permissive_email_autolinks"
-                    | "heading_ids"
-                    | "autolink_headings"
-            ) {
-                continue;
-            }
             if let Some(val) = opts_value.get_boolean_loose(global_this, camel)? {
                 set(&mut options, val);
             } else if *camel != *snake {

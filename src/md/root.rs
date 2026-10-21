@@ -167,7 +167,7 @@ impl Options {
         }
     }
 
-    /// `(snake_case, camelCase, setter)` for every bool field — used by
+    /// `(snake_case, camelCase, setter)` for each bool field set by name by
     /// `Bun.markdown`'s option parser.
     pub const BOOL_FIELD_SETTERS: &'static [(
         &'static str,
@@ -177,24 +177,6 @@ impl Options {
         ("tables", "tables", |o, v| o.tables = v),
         ("strikethrough", "strikethrough", |o, v| o.strikethrough = v),
         ("tasklists", "tasklists", |o, v| o.tasklists = v),
-        ("permissive_autolinks", "permissiveAutolinks", |o, v| {
-            o.permissive_autolinks = v
-        }),
-        (
-            "permissive_url_autolinks",
-            "permissiveUrlAutolinks",
-            |o, v| o.permissive_url_autolinks = v,
-        ),
-        (
-            "permissive_www_autolinks",
-            "permissiveWwwAutolinks",
-            |o, v| o.permissive_www_autolinks = v,
-        ),
-        (
-            "permissive_email_autolinks",
-            "permissiveEmailAutolinks",
-            |o, v| o.permissive_email_autolinks = v,
-        ),
         ("hard_soft_breaks", "hardSoftBreaks", |o, v| {
             o.hard_soft_breaks = v
         }),
@@ -215,10 +197,6 @@ impl Options {
         }),
         ("no_html_spans", "noHtmlSpans", |o, v| o.no_html_spans = v),
         ("tag_filter", "tagFilter", |o, v| o.tag_filter = v),
-        ("heading_ids", "headingIds", |o, v| o.heading_ids = v),
-        ("autolink_headings", "autolinkHeadings", |o, v| {
-            o.autolink_headings = v
-        }),
     ];
 }
 

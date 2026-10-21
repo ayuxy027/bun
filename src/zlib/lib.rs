@@ -163,9 +163,6 @@ pub struct ZlibReaderArrayList<'a> {
     pub(crate) zlib: zStream_struct,
     // allocator field dropped (global mimalloc)
     pub(crate) state: ZlibReaderArrayListState,
-    /// Decompression-bomb guard: `read_all` errors instead of growing the
-    /// output past this many bytes. Defaults to unbounded.
-    pub(crate) max_output_size: usize,
 }
 
 impl<'a> Drop for ZlibReaderArrayList<'a> {
@@ -211,7 +208,6 @@ impl<'a> ZlibReaderArrayList<'a> {
             list_ptr: list,
             zlib: bun_core::ffi::zeroed(),
             state: ZlibReaderArrayListState::Uninitialized,
-            max_output_size: usize::MAX,
         });
 
         let list_len = zlib_reader.list_ptr.len();
@@ -307,25 +303,14 @@ impl<'a> ZlibReaderArrayList<'a> {
                 //   flush parameter).
 
                 if self.zlib.avail_out == 0 {
-                    let produced = self.zlib.total_out as usize;
-                    let remaining_budget = self.max_output_size.saturating_sub(produced);
-                    if remaining_budget == 0 {
-                        self.state = ZlibReaderArrayListState::Error;
-                        return Err(ZlibError::ZlibError);
-                    }
-                    if self
-                        .list_ptr
-                        .try_reserve(remaining_budget.min(4096))
-                        .is_err()
-                    {
+                    if self.list_ptr.try_reserve(4096).is_err() {
                         self.state = ZlibReaderArrayListState::Error;
                         return Err(ZlibError::OutOfMemory);
                     }
                     // SAFETY: zlib writes the tail; len is truncated to `total_out` before any read.
                     let (next_out, avail_out) = unsafe { self.list_ptr.reserve_expand_tail(0) };
                     self.zlib.next_out = next_out;
-                    // Clamp so a single inflate call cannot write past `max_output_size`.
-                    self.zlib.avail_out = avail_out.min(remaining_budget) as uInt;
+                    self.zlib.avail_out = avail_out as uInt;
                 }
 
                 // Try to inflate even if avail_in is 0, as this could be a valid empty gzip stream

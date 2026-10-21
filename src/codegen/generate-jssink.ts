@@ -339,7 +339,7 @@ const ClassInfo JSReadableSinkControllerBase::s_info = { "ReadableSinkController
   var templ = head;
 
   for (let name of classes) {
-    const { className, controller, prototypeName, controllerName, controllerPrototypeName, constructor } = names(name);
+    const { className, controller } = names(name);
     templ += `
 
   void ${className}::ref() {
@@ -952,7 +952,7 @@ default:
   templ += footer;
 
   for (let name of classes) {
-    const { className, controller, prototypeName, controllerPrototypeName, constructor } = names(name);
+    const { controller } = names(name);
 
     templ += `
 extern "C" JSC::EncodedJSValue ${name}__createObject(JSC::JSGlobalObject* arg0, void* sinkPtr, uintptr_t destructor)
@@ -1190,7 +1190,7 @@ use bun_jsc::{self, host_fn, CallFrame, JSGlobalObject, JSValue};
 `;
 
   for (const name of classes) {
-    const rustPath = sinkPaths[name] ?? `crate::webcore::streams::${name}`;
+    const rustPath = sinkPaths[name];
     const JSSinkT = `crate::webcore::sink::JSSink::<${name}>`;
     templ += `// ════════════════════════════════════════════════════════════════════════════
 // ${name}
