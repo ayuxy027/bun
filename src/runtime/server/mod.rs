@@ -504,11 +504,7 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
         self.pending_requests.set(self.pending_requests.get() + 1);
     }
 
-    /// uWS filter: `Accepted` at TCP accept (before any TLS handshake), `AcceptedClosed` on
-    /// `HttpContext::onClose` / `HttpResponse::upgrade()` — see
-    /// `AsyncSocketData::filteredAccept`. Feeds [`Self::active_connection_count`].
-    /// `TunnelIdle` / `TunnelBusy`: a node:http tunnel becomes idle / has bytes to send again.
-    /// `IdleTunnelClosed`: it closes idle.
+    /// uWS connection filter: counts the accepted connections and the idle tunnels. Feeds [`Self::active_connection_count`].
     extern "C" fn on_connection_filter(
         _socket: *mut uws_sys::us_socket_t,
         opened: i32,

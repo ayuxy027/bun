@@ -3294,9 +3294,7 @@ where
         Ok(())
     }
 
-    /// node:http compat, from the connection filter: which events reach the JS `onConnection`
-    /// callback. Every connection is reported at TCP accept. A TLS connection is reported a
-    /// second time, as `secured`, when its handshake ends in success.
+    /// node:http: reports a connection to JS at TCP accept, and a TLS one again, as `secured`, when its handshake ends.
     #[inline]
     pub(crate) fn on_connection_event(&self, socket: *mut c_void, event: FilterEvent) {
         let secured = match event {
@@ -3317,10 +3315,7 @@ where
         crate::dispatch::fold(self.on_connection_callback(socket, secured));
     }
 
-    /// Hands the JSNodeHTTPServerSocket of a connection to the JS `onConnection` callback,
-    /// with the phase. `secured == false`: the connection was accepted, and `node:http` emits
-    /// 'connection'. `secured == true`: the handshake of a TLS connection succeeded, and
-    /// `node:http` emits 'secureConnection'. A handshake that failed is not reported.
+    /// Calls the JS `onConnection` callback with the socket and the phase. A handshake that failed is not reported.
     pub(crate) fn on_connection_callback(
         &self,
         socket: *mut c_void,
@@ -3731,9 +3726,7 @@ unsafe extern "C" {
         global: &JSGlobalObject,
     ) -> JSValue;
 
-    // `socket` is the live `uws::Socket*` of a TLS connection that the filter reports as
-    // `Opened`. Returns its JSNodeHTTPServerSocket when the handshake succeeded and the
-    // accept attached one, else the empty value. Runs no JS.
+    // `socket` is a live TLS `uws::Socket*`. Empty when the handshake failed or no socket is attached. Runs no JS.
     safe fn Bun__NodeHTTP__securedServerSocket(socket: *mut c_void) -> JSValue;
 
     // `&JSGlobalObject` / `&mut JSValue` discharge the deref'd-param

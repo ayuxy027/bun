@@ -486,12 +486,7 @@ bool JSNodeHTTPServerSocket::isAuthorized() const
         return httpResponseData->isAuthorized;
     }
 
-    // The handshake callback has not fired. At accept, and while the peer stalls, the
-    // handshake is pending and this is false. usockets fires the callback before it
-    // delivers any data of the connection (ssl_report_finished_handshake, openssl.c), so
-    // no HTTP handler runs in the window where BoringSSL has finished and the callback
-    // is still to come. node:http relies on that order: 'secureConnection' comes before
-    // the first request.
+    // Not fired: the handshake is pending, as at accept. usockets fires the callback before it delivers any data.
     return us_socket_is_ssl_handshake_finished(socket);
 }
 
@@ -1127,9 +1122,7 @@ extern "C" JSC::EncodedJSValue Bun__getOrCreateNodeHTTPServerSocket(bool isSSL, 
     return JSValue::encode(JSC::jsNull());
 }
 
-// For a TLS connection that the context filter reports as open, which is the end of its
-// handshake: the JSNodeHTTPServerSocket that the accept attached, when the handshake succeeded.
-// Empty when the handshake failed, or when nothing is attached.
+// At the end of a TLS handshake: the socket that the accept attached. Empty when the handshake failed or nothing is attached.
 extern "C" JSC::EncodedJSValue Bun__NodeHTTP__securedServerSocket(us_socket_t* us_socket)
 {
     auto* serverSocket = getNodeHTTPServerSocket<true>(us_socket);

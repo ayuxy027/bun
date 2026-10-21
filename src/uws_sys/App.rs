@@ -484,21 +484,20 @@ impl<const SSL: bool> ListenSocket<SSL> {
     }
 }
 
-/// What a connection filter hears (`AsyncSocketData::filtered*` in packages/bun-uws). The
-/// discriminants are the values C++ sends. C++ sends a plain `int`, so a handler takes an `i32`
-/// and decodes it with `from_repr`, which is `None` for a value this enum does not name.
+/// The `int` that `AsyncSocketData::filtered*` (packages/bun-uws) sends to a connection filter. Decode it with `from_repr`.
 #[repr(i32)]
 #[derive(Clone, Copy, Eq, PartialEq, Debug, strum::FromRepr)]
 pub enum FilterEvent {
-    /// Plain TCP: at accept, behind `Accepted`. TLS: when the handshake ends, in success or in
-    /// failure, except that `rejectUnauthorized` closes a refused peer without it.
+    /// Plain TCP: at accept, behind `Accepted`. TLS: when the handshake ends, also in failure.
     Opened = 1,
     Closed = -1,
     /// TCP accept on both transports, before any TLS handshake.
     Accepted = 2,
+    /// Sent by `HttpContext::onClose` and by `HttpResponse::upgrade()`.
     AcceptedClosed = -2,
     /// A node:http tunnel has bytes to send again.
     TunnelBusy = 3,
+    /// A node:http tunnel became idle.
     TunnelIdle = -3,
     /// An idle tunnel closed. Sent in place of `AcceptedClosed`.
     IdleTunnelClosed = -4,
