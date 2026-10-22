@@ -13,6 +13,7 @@
  *   node --test test/js/node/http2/node-http2-dropped-write.test.ts   (node v26.3.0)
  */
 import assert from "node:assert";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile } from "node:child_process";
 import diagnosticsChannel from "node:diagnostics_channel";
 import { once } from "node:events";
@@ -989,6 +990,28 @@ describe("client: the stream ends with DATA frames still queued", () => {
     }
   });
 
+  // node runs the callback in the store of the writer. Bun has no store there yet. Neither
+  // runs it in the store that was current when the session was made.
+  test("the callback of a queued write does not see the AsyncLocalStorage store of http2.connect()", async () => {
+    const storage = new AsyncLocalStorage<string>();
+    const peer = await rawServer({ grant: true });
+    const session = storage.run("session", () => connectOverTcp(peer.port));
+    try {
+      session.on("error", () => {});
+      await once(session, "connect");
+      const stream = session.request({ ":method": "POST", ":path": "/" });
+      stream.on("error", () => {});
+      stream.resume();
+      const store = await new Promise(resolve =>
+        storage.run("writer", () => stream.write(MB, () => resolve(storage.getStore()))),
+      );
+      assert.notStrictEqual(store, "session");
+    } finally {
+      session.destroy();
+      peer.close();
+    }
+  });
+
   // The session never got this write, so it has nothing to cancel: the holder completes it.
   test("destroy() leaves a write alone that a replaced _write() holds", async () => {
     const peer = await rawServer();
@@ -1179,6 +1202,78 @@ describe("server: the client leaves with DATA frames still queued", () => {
         server.close();
       }
     });
+  });
+
+  // The producer of #45728: it writes until write() returns false and goes on at 'drain'. After
+  // the client left, no write may be accepted, or the producer never stops. When the client
+  // closes its connection, Bun still emits the one 'drain' of the write that it completes.
+  type Producer = (
+    write: (chunk: Buffer) => boolean,
+    isGone: () => boolean,
+    on: (name: string, fn: () => void) => void,
+  ) => void;
+  const produce =
+    (count: { drains: number; accepted: number }, hasLeft: () => boolean): Producer =>
+    (write, isGone, on) => {
+      const pump = () => {
+        while (!isGone() && write(MB.subarray(0, 65536))) {
+          if (hasLeft() && ++count.accepted === 1000) return;
+        }
+      };
+      on("drain", () => {
+        if (hasLeft()) count.drains++;
+        pump();
+      });
+      pump();
+    };
+  leaves.slice(0, 3).forEach(([leaveName, leave], way) => {
+    for (const api of ["stream", "response"] as const) {
+      test(`a ${api} that is written until it is full stops when the client ${leaveName}`, async () => {
+        const count = { drains: 0, accepted: 0 };
+        let left = false;
+        const producer = produce(count, () => left);
+        const { promise: closed, resolve } = Promise.withResolvers<void>();
+        const server =
+          api === "stream"
+            ? http2.createServer()
+            : http2.createServer((_request, response) => {
+                response.on("error", () => {});
+                response.on("close", () => resolve());
+                response.writeHead(200);
+                producer(
+                  chunk => response.write(chunk),
+                  () => response.destroyed || response.stream.destroyed,
+                  (name, fn) => void response.on(name, fn),
+                );
+              });
+        server.on("sessionError", () => {});
+        if (api === "stream") {
+          server.on("stream", (stream: http2.ServerHttp2Stream) => {
+            stream.on("error", () => {});
+            stream.on("close", () => resolve());
+            stream.respond({ ":status": 200 });
+            producer(
+              chunk => stream.write(chunk),
+              () => stream.destroyed,
+              (name, fn) => void stream.on(name, fn),
+            );
+          });
+        }
+        const port = await listen(server);
+        const { socket, windowFull } = await rawRequest(port);
+        try {
+          await windowFull;
+          left = true;
+          leave(socket);
+          await closed;
+          await turns(2);
+          assert.deepStrictEqual(count, { drains: isBun && way === 1 ? 1 : 0, accepted: 0 });
+        } finally {
+          socket.destroy();
+          server.close();
+        }
+      });
+    }
   });
 
   // The server twin of the client tests. RST_STREAM(CANCEL) reaches the 'aborted' handler of the
