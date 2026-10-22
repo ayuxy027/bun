@@ -124,12 +124,105 @@ const codeOf = (error: unknown) => (error ? ((error as NodeJS.ErrnoException).co
 /**
  * Runs `script` in a child of this runtime and returns the JSON that it prints. An exception that
  * reaches 'uncaughtException' fails the test that is running, so those exchanges run in a child.
+ * A child that does not end is killed, and that fails the test that made it.
  */
 async function inChild(script: string) {
   const env = { ...process.env, BUN_DEBUG_QUIET_LOGS: "1" };
-  const { stdout } = await promisify(execFile)(process.execPath, ["-e", script], { env });
+  const options = { env, timeout: 45_000, killSignal: "SIGKILL" as const };
+  const { stdout } = await promisify(execFile)(process.execPath, ["-e", script], options);
   return JSON.parse(stdout);
 }
+// A child of a debug build starts slowly: its test gets more than the default 5 seconds.
+const childTest = { timeout: 60_000 };
+/**
+ * The start of a script for `inChild`. `finish(last)` prints the events and ends the child. The
+ * child also ends by itself, so that a missing callback fails the test with the events it has:
+ * twenty turns after `afterClose()`, and at a deadline.
+ */
+const CHILD_PRELUDE = `
+  const http2 = require("node:http2");
+  const net = require("node:net");
+  const frame = (type, flags, id, payload = Buffer.alloc(0)) => {
+    const header = Buffer.alloc(9);
+    header.writeUIntBE(payload.length, 0, 3);
+    header[3] = type;
+    header[4] = flags;
+    header.writeUInt32BE(id, 5);
+    return Buffer.concat([header, payload]);
+  };
+  const events = [];
+  const finish = last => {
+    events.push(last);
+    console.log(JSON.stringify(events));
+    process.exit(0);
+  };
+  process.on("uncaughtException", error => events.push("uncaught:" + (error.code || error.message)));
+  // A cancelled write calls back at most two turns after 'close'.
+  const afterClose = (turns = 20) => (turns > 0 ? setImmediate(afterClose, turns - 1) : finish("write:never"));
+  setTimeout(finish, 20000, "deadline");
+`;
+/**
+ * A script for `inChild`: a raw peer resets the request with `code` when it holds one window of
+ * the body. `prepare` is the code that sets the request up. The script prints what reached
+ * 'uncaughtException' and then what the write callback got.
+ */
+const resetUploadScript = (code: number, prepare: string) => `${CHILD_PRELUDE}
+  const server = net.createServer(socket => {
+    socket.on("error", () => {});
+    socket.write(frame(4, 0, 0));
+    let received = 0;
+    socket.on("data", chunk => {
+      received += chunk.length;
+      if (received <= ${WINDOW}) return;
+      received = -Infinity;
+      socket.write(Buffer.concat([frame(4, 1, 0), frame(3, 0, 1, Buffer.from([0, 0, 0, ${code}]))]));
+    });
+  });
+  server.listen(0, "127.0.0.1", () => {
+    const session = http2.connect("http://127.0.0.1:" + server.address().port);
+    session.on("error", () => {});
+    const request = session.request({ ":method": "POST", ":path": "/" });
+    ${prepare}
+    request.on("close", () => afterClose());
+    request.write(Buffer.alloc(1 << 20, 97), error => finish("write:" + (error ? error.code : "ok")));
+  });
+`;
+/** The same for a response: a raw client resets its request when it holds one window of the body. */
+const resetDownloadScript = (code: number, prepare: string) => `${CHILD_PRELUDE}
+  const field = (name, value) =>
+    Buffer.concat([Buffer.from([0x10, name.length]), Buffer.from(name), Buffer.from([value.length]), Buffer.from(value)]);
+  const server = http2.createServer();
+  server.on("sessionError", () => {});
+  server.on("stream", stream => {
+    ${prepare}
+    stream.on("close", () => afterClose());
+    stream.respond({ ":status": 200 });
+    stream.write(Buffer.alloc(1 << 20, 97), error => finish("write:" + (error ? error.code : "ok")));
+  });
+  server.listen(0, "127.0.0.1", () => {
+    const socket = net.connect(server.address().port, "127.0.0.1");
+    socket.on("error", () => {});
+    socket.on("connect", () => {
+      const headers = [field(":method", "GET"), field(":scheme", "http"), field(":path", "/"), field(":authority", "a")];
+      const request = frame(1, 5, 1, Buffer.concat(headers));
+      socket.write(Buffer.concat([Buffer.from("PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n"), frame(4, 0, 0), request]));
+    });
+    let received = 0;
+    socket.on("data", chunk => {
+      received += chunk.length;
+      if (received <= ${WINDOW}) return;
+      received = -Infinity;
+      socket.write(Buffer.concat([frame(4, 1, 0), frame(3, 0, 1, Buffer.from([0, 0, 0, ${code}]))]));
+    });
+  });
+`;
+// In the child, an 'aborted' listener that throws, and an 'error' listener that records.
+const throwingAbortedListener = (stream: string) => `
+  ${stream}.on("error", error => events.push("error:" + (error.code || error.message)));
+  ${stream}.on("aborted", () => {
+    throw new Error("thrown by the listener");
+  });
+`;
 
 interface RawPeer {
   port: number;
@@ -680,64 +773,26 @@ describe("client: the stream ends with DATA frames still queued", () => {
     });
   }
 
-  /**
-   * A script for `inChild`: the peer resets the request with `code` when it holds one window of
-   * the body. `prepare` is the code that sets the request up. The script prints what reached
-   * 'uncaughtException' and then what the write callback got.
-   */
-  const resetUploadScript = (code: number, prepare: string) => `
-    const http2 = require("node:http2");
-    const net = require("node:net");
-    const frame = (type, flags, id, payload = Buffer.alloc(0)) => {
-      const header = Buffer.alloc(9);
-      header.writeUIntBE(payload.length, 0, 3);
-      header[3] = type;
-      header[4] = flags;
-      header.writeUInt32BE(id, 5);
-      return Buffer.concat([header, payload]);
-    };
-    const events = [];
-    process.on("uncaughtException", error => events.push("uncaught:" + (error.code || error.message)));
-    const server = net.createServer(socket => {
-      socket.on("error", () => {});
-      socket.write(frame(4, 0, 0));
-      let received = 0;
-      socket.on("data", chunk => {
-        received += chunk.length;
-        if (received <= ${WINDOW}) return;
-        received = -Infinity;
-        socket.write(Buffer.concat([frame(4, 1, 0), frame(3, 0, 1, Buffer.from([0, 0, 0, ${code}]))]));
-      });
+  // After RST_STREAM(CANCEL) the listener runs outside the teardown, and its error is uncaught in
+  // both runtimes. After another code node does the same. Bun emits 'aborted' inside the teardown:
+  // the error of the listener is then the error of the stream. The write is cancelled in each case.
+  for (const [name, code] of [
+    ["NGHTTP2_CANCEL", NGHTTP2_CANCEL],
+    ["NGHTTP2_INTERNAL_ERROR", NGHTTP2_INTERNAL_ERROR],
+    ["NGHTTP2_REFUSED_STREAM", NGHTTP2_REFUSED_STREAM],
+  ] as const) {
+    const title = `the write in flight is cancelled when an 'aborted' listener throws after RST_STREAM(${name})`;
+    test(title, childTest, async () => {
+      const events = await inChild(resetUploadScript(code, throwingAbortedListener("request")));
+      const inTeardown = isBun && code !== NGHTTP2_CANCEL;
+      const thrown = inTeardown ? "error:thrown by the listener" : "uncaught:thrown by the listener";
+      assert.deepStrictEqual(events, [thrown, "write:ECANCELED"]);
     });
-    server.listen(0, "127.0.0.1", () => {
-      const session = http2.connect("http://127.0.0.1:" + server.address().port);
-      session.on("error", () => {});
-      const request = session.request({ ":method": "POST", ":path": "/" });
-      ${prepare}
-      request.write(Buffer.alloc(1 << 20, 97), error => {
-        events.push("write:" + (error ? error.code : "ok"));
-        console.log(JSON.stringify(events));
-        process.exit(0);
-      });
-    });
-  `;
-
-  test("the write in flight is cancelled when an 'aborted' listener throws", async () => {
-    const prepare = `
-      request.on("error", () => {});
-      request.on("aborted", () => {
-        throw new Error("thrown by the listener");
-      });
-    `;
-    assert.deepStrictEqual(await inChild(resetUploadScript(NGHTTP2_CANCEL, prepare)), [
-      "uncaught:thrown by the listener",
-      "write:ECANCELED",
-    ]);
-  });
+  }
 
   // node emits the error of the stream, and nothing handles it here. Bun emits no 'error' on a
   // stream that has no listener for it. The write fails in both.
-  test("the write in flight is cancelled on a stream that has no 'error' listener", async () => {
+  test("the write in flight is cancelled on a stream that has no 'error' listener", childTest, async () => {
     const events: string[] = await inChild(resetUploadScript(NGHTTP2_REFUSED_STREAM, ""));
     assert.strictEqual(events.at(-1), "write:ECANCELED");
   });
@@ -1043,6 +1098,21 @@ describe("server: the client leaves with DATA frames still queued", () => {
     });
   });
 
+  // The server twin of the client tests. RST_STREAM(CANCEL) reaches the 'aborted' handler of the
+  // session, and another code reaches the teardown of the stream.
+  for (const [name, code] of [
+    ["NGHTTP2_CANCEL", NGHTTP2_CANCEL],
+    ["NGHTTP2_INTERNAL_ERROR", NGHTTP2_INTERNAL_ERROR],
+  ] as const) {
+    const title = `response.write is cancelled when an 'aborted' listener throws after RST_STREAM(${name})`;
+    test(title, childTest, async () => {
+      const events = await inChild(resetDownloadScript(code, throwingAbortedListener("stream")));
+      const inTeardown = isBun && code !== NGHTTP2_CANCEL;
+      const thrown = inTeardown ? "error:thrown by the listener" : "uncaught:thrown by the listener";
+      assert.deepStrictEqual(events, [thrown, "write:ECANCELED"]);
+    });
+  }
+
   // The first response is stalled on its window, with the rest of its body in the queue of the
   // session. In Bun the END_STREAM frame of the second response, which has no payload, waits
   // behind that body today (#43422 ends that wait). In the request handler the session is in
@@ -1343,11 +1413,8 @@ describe("server: the client leaves with DATA frames still queued", () => {
 
     // The write and the first chunk of the file end in one frame. The callback of the write
     // throws when that frame leaves: the chunk of the file must still complete.
-    test("behind a closed window, the file arrives whole when the write callback throws", async () => {
-      const script = `
-        const http2 = require("node:http2");
-        const events = [];
-        process.on("uncaughtException", error => events.push("uncaught:" + error.message));
+    test("behind a closed window, the file arrives whole when the write callback throws", childTest, async () => {
+      const script = `${CHILD_PRELUDE}
         const server = http2.createServer();
         server.on("stream", stream => {
           stream.on("error", () => {});
@@ -1365,17 +1432,14 @@ describe("server: the client leaves with DATA frames still queued", () => {
           request.on("error", () => {});
           let received = 0;
           request.on("data", chunk => (received += chunk.length));
-          request.on("end", () => {
-            console.log(JSON.stringify({ events, received }));
-            process.exit(0);
-          });
+          request.on("end", () => finish("received:" + received));
           // Three round trips give the chunk of the file time to join the write in the queue.
           const open = () => session.settings({ initialWindowSize: ${WINDOW} });
           request.on("response", () => session.ping(() => session.ping(() => session.ping(open))));
           request.end();
         });
       `;
-      assert.deepStrictEqual(await inChild(script), { events: ["uncaught:thrown by the callback"], received: 101 });
+      assert.deepStrictEqual(await inChild(script), ["uncaught:thrown by the callback", "received:101"]);
     });
 
     test("over a JS stream, the write that left and the queued chunk of the file both complete", async () => {
