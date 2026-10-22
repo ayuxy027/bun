@@ -2919,13 +2919,7 @@ class Http2Stream extends (Duplex as Http2StreamBase) {
         }
         // A streamEnd(7) dispatch inside the call completes the callback through markWritableDone.
         this[bunHTTP2StreamFinal] = callback;
-        let settled: number | false;
-        try {
-          settled = native.writeStream(this.#id, "", "ascii", true, StreamWriter.Final);
-        } catch (error) {
-          if (this[bunHTTP2StreamFinal] === callback) this[bunHTTP2StreamFinal] = null;
-          return callback(error);
-        }
+        const settled = native.writeStream(this.#id, "", "ascii", true, StreamWriter.Final);
         if (this[bunHTTP2StreamFinal] === callback) {
           if (settled === false || (settled & kWriteFlushedWithoutCallback) !== 0) {
             // Nothing is queued: the stream cannot send, or the socket took the frame.
