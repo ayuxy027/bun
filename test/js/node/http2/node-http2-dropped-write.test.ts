@@ -943,6 +943,11 @@ describe("server: the client leaves with DATA frames still queued", () => {
     ],
   ];
   type Say = (answer: string) => void;
+  // A client that closes its connection: Bun completes the write in flight with no error, and
+  // "streams build no frames for what they have buffered when the transport closes" in
+  // node-http2.test.js holds that. The response still does not finish. node v26.3.0 cancels the
+  // write, as after every other way of leaving.
+  const [writeAtClose, endAtClose] = isBun ? ["ok", "ERR_STREAM_DESTROYED"] : ["ECANCELED", "ECANCELED"];
   // [name, how the server answers, the code it hears for each way of leaving]. `null` is the
   // error of the stream after a connection reset: the socket chooses its code.
   const answers: [string, (stream: http2.ServerHttp2Stream, say: Say) => void, (string | null)[]][] = [
@@ -952,7 +957,7 @@ describe("server: the client leaves with DATA frames still queued", () => {
         stream.respond({ ":status": 200 });
         stream.write(MB, error => say(codeOf(error)));
       },
-      ["ECANCELED", "ECANCELED", "ECANCELED", "ECANCELED"],
+      ["ECANCELED", writeAtClose, "ECANCELED", "ECANCELED"],
     ],
     [
       "stream.end(chunk, callback)",
@@ -960,7 +965,7 @@ describe("server: the client leaves with DATA frames still queued", () => {
         stream.respond({ ":status": 200 });
         stream.end(MB, (error?: Error) => say(codeOf(error)));
       },
-      ["ECANCELED", "ECANCELED", null, "ECANCELED"],
+      ["ECANCELED", endAtClose, null, "ECANCELED"],
     ],
     [
       "pipeline(source, stream)",
@@ -989,7 +994,8 @@ describe("server: the client leaves with DATA frames still queued", () => {
 
   for (const [answerName, answer, codes] of answers) {
     leaves.forEach(([leaveName, leave, nodeCallsBack], way) => {
-      test(`${answerName} fails when the client ${leaveName}`, { skip: !isBun && !nodeCallsBack }, async () => {
+      const outcome = codes[way] === "ok" ? "completes" : "fails";
+      test(`${answerName} ${outcome} when the client ${leaveName}`, { skip: !isBun && !nodeCallsBack }, async () => {
         const { promise: said, resolve: say } = Promise.withResolvers<string>();
         const server = http2.createServer();
         server.on("sessionError", () => {});
@@ -1012,9 +1018,11 @@ describe("server: the client leaves with DATA frames still queued", () => {
     });
   }
 
-  for (const [leaveName, leave, nodeCallsBack] of leaves) {
+  leaves.forEach(([leaveName, leave, nodeCallsBack], way) => {
     const skip = !isBun && !nodeCallsBack;
-    test(`response.write(chunk, callback) fails when the client ${leaveName}`, { skip }, async () => {
+    const code = way === 1 ? writeAtClose : "ECANCELED";
+    const outcome = code === "ok" ? "completes" : "fails";
+    test(`response.write(chunk, callback) ${outcome} when the client ${leaveName}`, { skip }, async () => {
       const { promise: said, resolve: say } = Promise.withResolvers<string>();
       const server = http2.createServer((_request, response) => {
         response.on("error", () => {});
@@ -1027,13 +1035,13 @@ describe("server: the client leaves with DATA frames still queued", () => {
       try {
         await windowFull;
         leave(socket);
-        assert.strictEqual(await said, "ECANCELED");
+        assert.strictEqual(await said, code);
       } finally {
         socket.destroy();
         server.close();
       }
     });
-  }
+  });
 
   // The first response is stalled on its window, with the rest of its body in the queue of the
   // session. In Bun the END_STREAM frame of the second response, which has no payload, waits
