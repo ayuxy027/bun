@@ -3,51 +3,56 @@ import { bunEnv, bunExe } from "harness";
 
 // A quantified group whose body has a fixed width and nothing to backtrack into, such as (?:ab)* or
 // ([0-9a-f]{2})+, runs without a per-iteration backtracking context. Before, every iteration kept
-// one, and a search with about two million iterations ran out of room and reported "no match".
-// The long inputs run in a child process with the RegExp JIT on and off, so both engines are covered.
-
-const BIG = 3_000_000;
+// one, and a search with more iterations than the pool of BUN_JSC_maxRegExpStackSize bytes (192 MB
+// by default, about two million iterations) had room for reported "no match". The long inputs run
+// in a child process with the RegExp JIT on and off. The interpreter is slow in a debug build, so
+// that run gets a smaller pool and a shorter input: the same bug at a lower threshold.
 
 // [source, flags, input expression, expected [index, length, capture 1 indices]]
-const cases: [string, string, string, [number, number, [number, number]?] | null][] = [
-  // The report: a group followed by $ on an input longer than the engine had room for.
-  ["^(?:a)*$", "", `rep("a", ${BIG})`, [0, BIG]],
-  ["(?:a)*$", "", `rep("a", ${BIG})`, [0, BIG]],
-  ["(?:ab)*$", "", `rep("ab", ${BIG / 2})`, [0, BIG]],
-  ["^(?:[0-9a-f]{2})+$", "", `rep("deadbeef", ${BIG / 8})`, [0, BIG]],
-  ["^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$", "", `rep("aGVs", ${BIG / 4}) + "bG8="`, [0, BIG + 4]],
-  // The group's capture is the last iteration.
-  ["(a)*$", "d", `rep("a", ${BIG})`, [0, BIG, [BIG - 1, BIG]]],
-  ["(ab)*$", "d", `rep("ab", ${BIG / 2})`, [0, BIG, [BIG - 2, BIG]]],
-  // A bounded or lazy group, and one the search has to give iterations back from.
-  ["(?:ab){2,}c", "", `rep("ab", ${BIG / 2}) + "c"`, [0, BIG + 1]],
-  ["(?:ab)*?c", "", `rep("ab", ${BIG / 2}) + "c"`, [0, BIG + 1]],
-  ["(?:ab)*abab$", "", `rep("ab", ${BIG / 2})`, [0, BIG]],
-  ["(ab)*abab$", "d", `rep("ab", ${BIG / 2})`, [0, BIG, [BIG - 6, BIG - 4]]],
-  ["^(?:ab)*$", "", `rep("ab", ${BIG / 2}) + "a"`, null],
-  // A body that is two code units wide.
-  ["^(?:\\u{1F600})+$", "u", `rep("\\u{1F600}", ${BIG / 2})`, [0, BIG]],
-];
+function casesFor(BIG: number): [string, string, string, [number, number, [number, number]?] | null][] {
+  return [
+    // The report: a group followed by $ on an input longer than the engine had room for.
+    ["^(?:a)*$", "", `rep("a", ${BIG})`, [0, BIG]],
+    ["(?:a)*$", "", `rep("a", ${BIG})`, [0, BIG]],
+    ["(?:ab)*$", "", `rep("ab", ${BIG / 2})`, [0, BIG]],
+    ["^(?:[0-9a-f]{2})+$", "", `rep("deadbeef", ${BIG / 8})`, [0, BIG]],
+    ["^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$", "", `rep("aGVs", ${BIG / 4}) + "bG8="`, [0, BIG + 4]],
+    // The group's capture is the last iteration.
+    ["(a)*$", "d", `rep("a", ${BIG})`, [0, BIG, [BIG - 1, BIG]]],
+    ["(ab)*$", "d", `rep("ab", ${BIG / 2})`, [0, BIG, [BIG - 2, BIG]]],
+    // A bounded or lazy group, and one the search has to give iterations back from.
+    ["(?:ab){2,}c", "", `rep("ab", ${BIG / 2}) + "c"`, [0, BIG + 1]],
+    ["(?:ab)*?c", "", `rep("ab", ${BIG / 2}) + "c"`, [0, BIG + 1]],
+    ["(?:ab)*abab$", "", `rep("ab", ${BIG / 2})`, [0, BIG]],
+    ["(ab)*abab$", "d", `rep("ab", ${BIG / 2})`, [0, BIG, [BIG - 6, BIG - 4]]],
+    ["^(?:ab)*$", "", `rep("ab", ${BIG / 2}) + "a"`, null],
+    // A body that is two code units wide.
+    ["^(?:\\u{1F600})+$", "u", `rep("\\u{1F600}", ${BIG / 2})`, [0, BIG]],
+  ];
+}
 
-const script = `
-  const rep = (s, n) => Buffer.alloc(Buffer.byteLength(s) * n, s).toString();
-  const cases = ${JSON.stringify(cases.map(([source, flags, input]) => [source, flags, input]))};
-  const out = [];
-  for (const [source, flags, input] of cases) {
-    const m = new RegExp(source, flags).exec(eval(input));
-    out.push(m && [m.index, m[0].length, ...(m.indices ? [m.indices[1]] : [])]);
-  }
-  console.log(JSON.stringify(out));
-`;
+function scriptFor(cases: ReturnType<typeof casesFor>): string {
+  return `
+    const rep = (s, n) => Buffer.alloc(Buffer.byteLength(s) * n, s).toString();
+    const cases = ${JSON.stringify(cases.map(([source, flags, input]) => [source, flags, input]))};
+    const out = [];
+    for (const [source, flags, input] of cases) {
+      const m = new RegExp(source, flags).exec(eval(input));
+      out.push(m && [m.index, m[0].length, ...(m.indices ? [m.indices[1]] : [])]);
+    }
+    console.log(JSON.stringify(out));
+  `;
+}
 
 describe.concurrent("a quantified fixed-width group matches inputs longer than the engine's backtracking pool", () => {
-  for (const [label, env] of [
-    ["JIT", {}],
-    ["interpreter", { BUN_JSC_useRegExpJIT: "false" }],
+  for (const [label, env, BIG] of [
+    ["JIT, 192 MB pool", {}, 3_000_000],
+    ["interpreter, 16 MB pool", { BUN_JSC_useRegExpJIT: "false", BUN_JSC_maxRegExpStackSize: "16777216" }, 400_000],
   ] as const) {
     test(label, async () => {
+      const cases = casesFor(BIG);
       await using proc = Bun.spawn({
-        cmd: [bunExe(), "-e", script],
+        cmd: [bunExe(), "-e", scriptFor(cases)],
         env: { ...bunEnv, ...env },
         stderr: "pipe",
       });
